@@ -250,8 +250,13 @@ lock_acquire() {
     { : > "$CONF_DIR/.lock"; } 2>/dev/null || return 0
     # 注意：exec 不带命令时重定向会永久生效，这里绝不能加 2>/dev/null，否则全脚本 stderr 报废
     exec 9>"$CONF_DIR/.lock" || return 0
-    flock -w 5 9 2>/dev/null && return 0
-    flock -n 9 2>/dev/null && return 0              # busybox flock 不支持 -w
+    # 统一用 -n 轮询等待 5 秒：busybox 的 flock 不支持 -w，这样两个平台行为一致
+    local i=0
+    while [ "$i" -lt 25 ]; do
+        flock -n 9 2>/dev/null && return 0
+        i=$((i + 1))
+        [ "$i" -lt 25 ] && sleep 0.2
+    done
     exec 9>&-
     return 1
 }
