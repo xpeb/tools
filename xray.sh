@@ -1233,7 +1233,7 @@ show_nodes() {
     printf '\n'
 
     local opt
-    opt=$(ask "输入序号查看链接（sub 导出订阅，回车返回）" "") || return 0
+    opt=$(ask "输入序号查看链接（回车返回）" "") || return 0
     [ -z "$opt" ] && return 0
 
     if [ "$opt" = "sub" ]; then
