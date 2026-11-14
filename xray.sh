@@ -135,9 +135,14 @@ pause_tip() { read -rp "$(printf '%b[提示]%b 按回车键继续...' "$C_CYAN" 
 
 # ── 依赖 ──────────────────────────────────────────────────────────────
 check_deps() {
-    local need="" cmd miss=""
-    for cmd in curl unzip openssl jq; do
-        command -v "$cmd" >/dev/null 2>&1 || need+=" $cmd"
+    local need="" cmd miss="" pkg
+    for cmd in curl unzip openssl jq flock; do
+        command -v "$cmd" >/dev/null 2>&1 && continue
+        case "$cmd" in
+            flock) pkg="util-linux" ;;   # flock 属于 util-linux；Alpine 由 busybox 提供
+            *)     pkg="$cmd" ;;
+        esac
+        need+=" $pkg"
     done
     # 最小化系统常缺 CA 根证书，curl 会以 error 77 静默失败（表现为"网络不通"）
     if [ ! -s /etc/ssl/certs/ca-certificates.crt ] \
@@ -165,7 +170,7 @@ check_deps() {
     fi
 
     # 装完必须复验，不能"发完命令就当成功"
-    for cmd in curl unzip openssl jq; do
+    for cmd in curl unzip openssl jq flock; do
         command -v "$cmd" >/dev/null 2>&1 || miss+=" $cmd"
     done
     if [ ! -s /etc/ssl/certs/ca-certificates.crt ] \
@@ -680,12 +685,12 @@ p_info_shadowsocks() {
 
 # ── 协议生成钩子：p_gen_<t> 交互采集 → 输出 inbound JSON ───
 
-# VLESS 两种传输：REALITY + Vision(TCP) / REALITY + XHTTP
+# VLESS 两种传输：REALITY + Vision / REALITY + XHTTP
 p_gen_vless() {
     {
         printf '\n%b选择传输方式%b\n' "$C_BOLD" "$C_RESET"
         draw_line "-"
-        printf '%b1.%b REALITY + Vision (TCP)\n' "$C_CYAN" "$C_RESET"
+        printf '%b1.%b REALITY + Vision\n' "$C_CYAN" "$C_RESET"
         printf '%b2.%b REALITY + XHTTP\n' "$C_CYAN" "$C_RESET"
         printf '%b0.%b 返回菜单\n' "$C_DIM" "$C_RESET"
         draw_line "-"
@@ -916,10 +921,6 @@ print_node_card() {
 
     if [ -n "$link4" ]; then
         printf '\n%bIPv4 分享链接:%b\n  %b%s%b\n' "$C_BOLD" "$C_RESET" "$C_GREEN" "$link4" "$C_RESET"
-        if command -v qrencode >/dev/null 2>&1; then
-            printf '\n%bIPv4 二维码 (客户端扫码):%b\n' "$C_DIM" "$C_RESET"
-            qrencode -t ANSIUTF8 "$link4" 2>/dev/null || true
-        fi
     fi
     if [ -n "$link6" ]; then
         printf '\n%bIPv6 分享链接:%b\n  %b%s%b\n' "$C_BOLD" "$C_RESET" "$C_GREEN" "$link6" "$C_RESET"

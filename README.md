@@ -22,7 +22,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/xpeb/vps-tools/main/xray.sh)
 
 | 协议 | 传输 | 说明 |
 |---|---|---|
-| VLESS | REALITY + Vision (TCP) | `flow: xtls-rprx-vision` |
+| VLESS | REALITY + Vision | `flow: xtls-rprx-vision` |
 | VLESS | REALITY + XHTTP | 随机路径，`mode: auto` |
 | Hysteria 2 | QUIC / HTTP3 | 端口伪装成 HTTP/3 页面 |
 | Shadowsocks | TCP + UDP | `2022-blake3-aes-128-gcm` |
@@ -57,7 +57,7 @@ flock 锁 → 同分区 .json 临时文件 → 端口冲突断言 → xray run -
 - Debian 11+ / Ubuntu 20.04+ / Alpine
 - x86_64 / aarch64 / armv7l
 - 依赖：`curl` `jq` `unzip` `openssl` `ca-certificates`（启动时自动检查安装）
-- 可选：`qrencode`（二维码）、`flock`（并发锁）
+- 依赖里包含 `flock`（配置写入的并发锁，缺失会自动安装 `util-linux`）
 
 ## 测试
 
