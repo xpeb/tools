@@ -847,10 +847,13 @@ p_edit_shadowsocks() {
 # ── 链接、节点表格、订阅 ──────────────────────────────────────────────
 
 build_link() {
-    local j="$1" host="$2" t
+    local j="$1" host="$2" t link
     t=$(n_proto "$j")
     declare -F "p_info_$t" >/dev/null 2>&1 || return 0
-    p_field "$("p_info_$t" "$j" "$host")" 5
+    link=$(p_field "$("p_info_$t" "$j" "$host")" 5)
+    # 带换行输出：调用方可能连续取多条链接，缺换行会粘成一行
+    [ -n "$link" ] && printf '%s\n' "$link"
+    return 0
 }
 
 # 一次 jq 拿全部节点（含索引），避免每行 8 次 jq 的 N+1
@@ -924,41 +927,7 @@ print_node_card() {
     printf '\n'
 }
 
-# 按协议族汇总链接（进程替换在部分环境不可用，这里用管道）
-links_for() {
-    local fam="$1" host="" idx j l
-    refresh_ips
-    if [ "$fam" = 4 ]; then host="$PUB_IPV4"; else host="[${PUB_IPV6}]"; fi
-    case "$host" in ""|"[]") return 0 ;; esac
-    node_stream | while IFS=$'\t' read -r idx j; do
-        [ -z "$j" ] && continue
-        l=$(build_link "$j" "$host")
-        [ -n "$l" ] && printf '%s\n' "$l"
-    done
-}
 
-export_subscription() {
-    local l4 l6
-    [ "$(conf_count)" -eq 0 ] && { warn "暂无入站节点"; return 0; }
-
-    l4=$(links_for 4)
-    l6=$(links_for 6)
-
-    printf '\n'
-    draw_line "-" "$C_CYAN"
-    printf '%b[聚合订阅] 可直接复制导入客户端%b\n' "$C_BOLD" "$C_RESET"
-    if [ -n "$l4" ]; then
-        printf '\n%bIPv4 订阅 (Base64):%b\n%b%s%b\n' "$C_BOLD" "$C_RESET" "$C_GREEN" \
-            "$(printf '%s' "$l4" | base64 | tr -d '\r\n')" "$C_RESET"
-    fi
-    if [ -n "$l6" ]; then
-        printf '\n%bIPv6 订阅 (Base64):%b\n%b%s%b\n' "$C_BOLD" "$C_RESET" "$C_GREEN" \
-            "$(printf '%s' "$l6" | base64 | tr -d '\r\n')" "$C_RESET"
-    fi
-    [ -z "$l4" ] && [ -z "$l6" ] && warn "未检测到公网 IP，无法生成订阅"
-    draw_line "-" "$C_CYAN"
-    printf '\n'
-}
 # ── 核心安装 / 版本 / 证书 / 系统加速 ────────────────────────
 
 latest_ver() {
@@ -1236,10 +1205,7 @@ show_nodes() {
     opt=$(ask "输入序号查看链接（回车返回）" "") || return 0
     [ -z "$opt" ] && return 0
 
-    if [ "$opt" = "sub" ]; then
-        export_subscription
-        pause_tip
-    elif [[ "$opt" =~ ^[0-9]+$ ]] && [ "$opt" -lt "$n" ]; then
+    if [[ "$opt" =~ ^[0-9]+$ ]] && [ "$opt" -lt "$n" ]; then
         local j
         j=$(conf_node "$opt")
         if [ -n "$j" ]; then
@@ -1279,6 +1245,7 @@ manage_service() {
     printf '%b3.%b 启动服务\n' "$C_CYAN" "$C_RESET"
     printf '%b4.%b 实时日志\n' "$C_CYAN" "$C_RESET"
     printf '%b5.%b 证书信息\n' "$C_CYAN" "$C_RESET"
+    printf '%b6.%b 环境体检\n' "$C_CYAN" "$C_RESET"
     printf '%b0. 返回菜单%b\n' "$C_DIM" "$C_RESET"
     draw_line "-"
 
@@ -1290,6 +1257,7 @@ manage_service() {
         3) if svc_start; then ok "服务已启动"; else err "启动失败，请检查端口与日志"; fi; sleep 0.8 ;;
         4) svc_log ;;
         5) cls; cert_info; printf '\n'; pause_tip ;;
+        6) cls; doctor; pause_tip ;;
         *) return 0 ;;
     esac
 }

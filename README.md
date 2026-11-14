@@ -48,10 +48,10 @@ bash <(curl -fsSL https://raw.githubusercontent.com/xpeb/vps-tools/main/xray.sh)
 
 > **UDP 入站注意**：官方文档指出，若网卡存在多个 IP 而客户端连接的是非首选地址，UDP 入站监听 `::`
 > 会导致回包源地址错误、连接不通。多公网 IP 的机器请把 Hysteria 的 `listen` 改成具体网卡 IP。
-- **多栈网络与一键聚合订阅**：
+- **多栈网络与分享链接**：
   - IPv4 / IPv6 独立探测，互不短路；
-  - 输入 `sub` 导出全节点 Base64 聚合订阅（双栈分开生成）；
-  - 分享链接自动补齐 `fp=chrome`（REALITY 必需 uTLS 指纹），SS 链接遵循 SIP002。
+  - 每个节点单独生成分享链接，双栈分开输出；
+  - 链接自动补齐 `fp=chrome`（REALITY 必需 uTLS 指纹），SS 遵循 SIP002。
 - **配置模型收敛**：
   - `_meta` 只保留无法从 Xray 配置推导的字段（如 REALITY 公钥 `pbk`）；
   - 其余一律读真实字段，不存在"改了一处另一处没同步"的漂移；
@@ -107,5 +107,5 @@ bash <(curl -fsSL https://raw.githubusercontent.com/xpeb/vps-tools/main/cliproxy
 `xray.sh` 在 Debian 13 (trixie) / x86_64 上跑过全量真机回归：**108 项断言全过**。
 
 覆盖：依赖自举、环境初始化、核心安装、六种协议生成、事务写入、服务与端口监听、
-六种链接格式、IPv6 方括号、表格、订阅、端口冲突拒绝、非法配置拒绝、节点编辑与删除、
+五种链接格式、IPv6 方括号、表格、端口冲突拒绝、非法配置拒绝、节点编辑与删除、
 配置迁移幂等、坏配置回滚、体检、重启/停止/启动、彻底卸载。
