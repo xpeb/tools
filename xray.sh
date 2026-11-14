@@ -12,8 +12,8 @@ if [ "${XRAY_TEST:-0}" != "1" ] && [ "$(id -u)" -ne 0 ]; then
     exit 1
 fi
 
-# 非交互兜底：管道喂给 bash 且当前有控制终端时，重定向 stdin 接管键盘。
-# 仅在「作为主脚本 + 无参数（菜单模式）」时生效，避免破坏管道输入。
+# 非交互兜底：脚本已落盘（bash <(curl ...) 或本地文件）且 stdin 不是终端时，
+# 把 stdin 换成终端。curl | bash 不能在这里做——那时 stdin 正是脚本本身。
 if [ "${BASH_SOURCE[0]}" = "$0" ] && [ $# -eq 0 ] && [ ! -t 0 ]; then
     { exec < /dev/tty; } 2>/dev/null || true
 fi
@@ -71,10 +71,10 @@ mk_tmp_dir() {
     return 0
 }
 
-ok()   { printf '%b[成功]%b %s\n' "$C_GREEN" "$C_RESET" "$*"; }
-err()  { printf '%b[失败]%b %s\n' "$C_RED" "$C_RESET" "$*" >&2; }
-warn() { printf '%b[警告]%b %s\n' "$C_YELLOW" "$C_RESET" "$*"; }
-info() { printf '%b[提示]%b %s\n' "$C_CYAN" "$C_RESET" "$*"; }
+ok()   { printf '%b[成功]%b %b\n' "$C_GREEN" "$C_RESET" "$*"; }
+err()  { printf '%b[失败]%b %b\n' "$C_RED" "$C_RESET" "$*" >&2; }
+warn() { printf '%b[警告]%b %b\n' "$C_YELLOW" "$C_RESET" "$*"; }
+info() { printf '%b[提示]%b %b\n' "$C_CYAN" "$C_RESET" "$*"; }
 
 draw_line() {
     local char="${1:--}" color="${2:-}" cols line
@@ -217,6 +217,7 @@ conf_node() { jq -c --argjson i "${1:-0}" '.inbounds[$i] // empty' "$CONF" 2>/de
 # 端口冲突断言：同端口 + 同协议族（tcp/udp/both 相交）才算冲突
 conf_assert_ports() {
     local f="$1" pmap="$2" dup
+    [ -n "$pmap" ] || { err "端口映射为空，无法校验端口冲突"; return 1; }
     dup=$(jq -r --argjson m "$pmap" '
         [ .inbounds | to_entries[] | { i: .key, p: .value.port, t: ($m[.value.protocol] // "tcp") } ] as $x |
         $x[] as $a | $x[] as $b |
@@ -579,6 +580,16 @@ declare -A P_NET=(   [vless]="tcp" [hysteria]="udp" \
                      [shadowsocks]="both" )
 declare -A P_DEFPORT=( [vless]=443 [hysteria]=8443 \
                        [shadowsocks]=8388 )
+
+# 协议 → 监听协议族（tcp/udp/both），供端口冲突断言使用
+proto_portmap() {
+    local t sep="" out="{"
+    for t in "${PROTOS[@]}"; do
+        out+="${sep}\"${t}\":\"${P_NET[$t]:-tcp}\""
+        sep=","
+    done
+    printf '%s}' "$out"
+}
 
 n_proto() { jq -r '.protocol // ""' <<< "$1" 2>/dev/null; }
 n_port()  { jq -r '.port // 0' <<< "$1" 2>/dev/null; }
@@ -1448,6 +1459,10 @@ menu_body() {
 }
 
 main_menu() {
+    # curl | bash：脚本已从 stdin 读完，此刻可把 stdin 换成终端接管键盘
+    if [ -z "${BASH_SOURCE[0]}" ] && [ ! -t 0 ]; then
+        { exec < /dev/tty; } 2>/dev/null || true
+    fi
     check_deps || { err "环境依赖缺失，终止"; exit 1; }
     setup_shortcut
     refresh_ips
@@ -1486,6 +1501,8 @@ main_menu() {
     done
 }
 # ── 入口：仅在被直接执行时启动；被 source 时不动作（方便测试） ───
-if [ "${BASH_SOURCE[0]}" = "$0" ]; then
+# 直接执行时 BASH_SOURCE[0] 等于 $0；curl | bash 时 BASH_SOURCE[0] 为空。
+# 被 source 时两者不同且 BASH_SOURCE[0] 非空 —— 那种情况不启动菜单。
+if [ "${BASH_SOURCE[0]}" = "$0" ] || [ -z "${BASH_SOURCE[0]}" ]; then
     main_menu "$@"
 fi
