@@ -1217,7 +1217,7 @@ show_nodes() {
         sleep 1
     fi
 }
-# ── 服务菜单 / 卸载 / 体检 ──────────────────────────────────────
+# ── 服务菜单 / 卸载 ──────────────────────────────────────
 
 svc_log() {
     trap ':' INT
@@ -1245,7 +1245,6 @@ manage_service() {
     printf '%b3.%b 启动服务\n' "$C_CYAN" "$C_RESET"
     printf '%b4.%b 实时日志\n' "$C_CYAN" "$C_RESET"
     printf '%b5.%b 证书信息\n' "$C_CYAN" "$C_RESET"
-    printf '%b6.%b 环境体检\n' "$C_CYAN" "$C_RESET"
     printf '%b0. 返回菜单%b\n' "$C_DIM" "$C_RESET"
     draw_line "-"
 
@@ -1257,7 +1256,6 @@ manage_service() {
         3) if svc_start; then ok "服务已启动"; else err "启动失败，请检查端口与日志"; fi; sleep 0.8 ;;
         4) svc_log ;;
         5) cls; cert_info; printf '\n'; pause_tip ;;
-        6) cls; doctor; pause_tip ;;
         *) return 0 ;;
     esac
 }
@@ -1292,84 +1290,6 @@ uninstall_xray() {
     exit 0
 }
 
-# ── 体检 ──────────────────────────────────────────────────────────────
-_chk() {
-    local d="$1"; shift
-    if "$@" >/dev/null 2>&1; then
-        ok_cnt=$((ok_cnt + 1))
-        printf '  %b[ OK ]%b %s\n' "$C_GREEN" "$C_RESET" "$d"
-    else
-        bad_cnt=$((bad_cnt + 1))
-        printf '  %b[ !! ]%b %s\n' "$C_RED" "$C_RESET" "$d"
-    fi
-}
-
-doctor() {
-    local ver n idx j port proto ok_cnt=0 bad_cnt=0
-    printf '\n%b环境体检%b\n' "$C_BOLD" "$C_RESET"
-    draw_line "-"
-
-    _chk "root 权限" test "$(id -u)" -eq 0
-    _chk "curl" command -v curl
-    _chk "unzip" command -v unzip
-    _chk "openssl" command -v openssl
-    _chk "jq" command -v jq
-    _chk "flock (并发锁)" command -v flock
-
-    ver=$(cur_core_ver)
-    if [ -n "$ver" ]; then
-        printf '  %b[ OK ]%b 核心已安装: %s\n' "$C_GREEN" "$C_RESET" "$ver"
-    else
-        printf '  %b[ !! ]%b 核心未安装\n' "$C_RED" "$C_RESET"; bad_cnt=$((bad_cnt+1))
-    fi
-
-    if conf_exists && jq -e . "$CONF" >/dev/null 2>&1; then
-        printf '  %b[ OK ]%b 配置 JSON 合法\n' "$C_GREEN" "$C_RESET"; ok_cnt=$((ok_cnt+1))
-    else
-        printf '  %b[ !! ]%b 配置文件缺失或非法\n' "$C_RED" "$C_RESET"; bad_cnt=$((bad_cnt+1))
-    fi
-
-    n=$(conf_count)
-    if is_running; then
-        printf '  %b[ OK ]%b 服务运行中 (PID %s)\n' "$C_GREEN" "$C_RESET" "$(svc_pid)"; ok_cnt=$((ok_cnt+1))
-    else
-        printf '  %b[ !! ]%b 服务未运行\n' "$C_RED" "$C_RESET"; bad_cnt=$((bad_cnt+1))
-    fi
-
-    printf '  %b[ -- ]%b 入站节点: %s 个\n' "$C_DIM" "$C_RESET" "$n"
-    # 服务没起来时端口检查没有意义，只会有噪音
-    if [ -n "$(svc_pid)" ]; then
-        local port_report
-        port_report=$(node_stream | while IFS=$'\t' read -r idx j; do
-            [ -z "$j" ] && continue
-            port=$(n_port "$j")
-            proto=$(n_proto "$j")
-            proto="${P_NET[$proto]:-tcp}"
-            if port_listening "$port" "$proto"; then
-                printf '  %b[ OK ]%b 端口 %s (%s) 正在监听\n' "$C_GREEN" "$C_RESET" "$port" "$proto"
-            else
-                printf '  %b[ !! ]%b 端口 %s (%s) 未监听\n' "$C_RED" "$C_RESET" "$port" "$proto"
-            fi
-        done)
-        [ -n "$port_report" ] && printf '%s\n' "$port_report"
-        ok_cnt=$((ok_cnt + $(printf '%s\n' "$port_report" | grep -c '\[ OK \]' || true)))
-        bad_cnt=$((bad_cnt + $(printf '%s\n' "$port_report" | grep -c '\[ !! \]' || true)))
-    else
-        printf '  %b[ -- ]%b 服务未运行，跳过端口检查\n' "$C_DIM" "$C_RESET"
-    fi
-
-    if [ -s "$CERTS_DIR/cert.crt" ]; then
-        local end
-        end=$(openssl x509 -in "$CERTS_DIR/cert.crt" -noout -enddate 2>/dev/null | cut -d= -f2)
-        printf '  %b[ -- ]%b 自签证书有效期至: %s\n' "$C_DIM" "$C_RESET" "${end:-未知}"
-    fi
-
-    draw_line "-"
-    local total=$((ok_cnt + bad_cnt))
-    if [ "$bad_cnt" -eq 0 ]; then ok "体检通过：${total} 项全部正常"
-    else warn "共 ${total} 项：${ok_cnt} 正常，${bad_cnt} 异常"; fi
-    return 0
-}
 # ── 看板 ──────────────────────────────────────────────────────────────
 menu_header() {
     local ver st upd="" node_cnt bbr bbr_badge ip_summary
