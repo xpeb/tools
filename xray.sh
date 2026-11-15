@@ -139,6 +139,13 @@ ask() {
 pause_tip() { read -rp "$(printf '%b[提示]%b 按回车键继续...' "$C_CYAN" "$C_RESET")" _ || true; }
 
 # ── 依赖 ──────────────────────────────────────────────────────────────
+# 最小化系统常缺 CA 根证书，curl 会以 error 77 静默失败（表现为"网络不通"）
+ca_certs_ok() {
+    [ -s /etc/ssl/certs/ca-certificates.crt ] \
+        || [ -s /etc/pki/tls/certs/ca-bundle.crt ] \
+        || [ -s /etc/ssl/cert.pem ]
+}
+
 check_deps() {
     local need="" cmd miss="" pkg
     for cmd in curl unzip openssl jq flock; do
@@ -149,12 +156,7 @@ check_deps() {
         esac
         need+=" $pkg"
     done
-    # 最小化系统常缺 CA 根证书，curl 会以 error 77 静默失败（表现为"网络不通"）
-    if [ ! -s /etc/ssl/certs/ca-certificates.crt ] \
-        && [ ! -s /etc/pki/tls/certs/ca-bundle.crt ] \
-        && [ ! -s /etc/ssl/cert.pem ]; then
-        need+=" ca-certificates"
-    fi
+    ca_certs_ok || need+=" ca-certificates"
     if ! command -v setcap >/dev/null 2>&1; then
         if command -v apt-get >/dev/null 2>&1; then need+=" libcap2-bin"
         elif command -v apk >/dev/null 2>&1; then need+=" libcap"; fi
@@ -178,11 +180,7 @@ check_deps() {
     for cmd in curl unzip openssl jq flock; do
         command -v "$cmd" >/dev/null 2>&1 || miss+=" $cmd"
     done
-    if [ ! -s /etc/ssl/certs/ca-certificates.crt ] \
-        && [ ! -s /etc/pki/tls/certs/ca-bundle.crt ] \
-        && [ ! -s /etc/ssl/cert.pem ]; then
-        miss+=" ca-certificates"
-    fi
+    ca_certs_ok || miss+=" ca-certificates"
     if [ -n "$miss" ]; then err "依赖安装失败:$miss"; return 1; fi
     ok "依赖已就绪"
     return 0
@@ -333,7 +331,7 @@ ensure_xray_user() {
     mkdir -p "$CONF_DIR" "$CERTS_DIR" /var/log/xray 2>/dev/null || true
     chown -R xray:xray "$CONF_DIR" /var/log/xray 2>/dev/null || true
     chmod 700 "$CONF_DIR" "$CERTS_DIR" 2>/dev/null || true
-    [ -f "$CONF" ] && chmod 600 "$CONF" 2>/dev/null || true
+    [ -f "$CONF" ] && { chmod 600 "$CONF" 2>/dev/null || true; }
 }
 
 init_env() {
@@ -364,7 +362,6 @@ svc_pid() {
     if [ "$SVC_BACKEND" = "systemd" ]; then
         local p
         p=$(systemctl show -p MainPID --value "$SVC_NAME" 2>/dev/null | tr -d ' \r\n')
-        [ -z "$p" ] && p=$(systemctl show -p MainPID "$SVC_NAME" 2>/dev/null | sed 's/^MainPID=//')
         [ "$p" = "0" ] && p=""
         printf '%s' "$p"
     else
@@ -449,7 +446,7 @@ svc_stop() {
 # 端口是否在监听：直接读 /proc，不依赖 ss/netstat
 port_listening() {
     local p="$1" proto="${2:-tcp}" hex f
-    hex=$(printf '%04X' "$p" 2>/dev/null) || return 1
+    hex=$(printf '%04X' "$p" 2>/dev/null)
     [ -z "$hex" ] && return 1
     if [ "$proto" != "udp" ]; then
         for f in /proc/net/tcp /proc/net/tcp6; do
