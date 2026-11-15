@@ -28,6 +28,7 @@ VER_CACHE="$CONF_DIR/.latest_ver"
 SHORTCUT="/usr/local/bin/xraym"
 ASSET_DIR="/usr/local/share/xray"
 META_VER=3
+MODEL_VER_FILE="$CONF_DIR/.model_ver"   # 配置模型版本，不写进 Xray 配置
 
 PUB_IPV4=""
 PUB_IPV6=""
@@ -215,7 +216,7 @@ refresh_ips() {
     return 0
 }
 # ── 配置读写与事务引擎 ──────────────────────────────────────────────────
-# 读只走真实字段，_meta 只保留「无法从 Xray 配置推导」的数据（Reality 公钥 pbk /
+# 读取只走 Xray 配置里的真实字段，配置内不写任何非内核字段
 # hysteria 的 SNI），这样 edit 时不存在双写漂移。
 
 conf_exists() { [ -s "$CONF" ]; }
@@ -326,13 +327,16 @@ conf_mutate() {
 conf_migrate() {
     [ -s "$CONF" ] || return 0
     local v
-    v=$(jq -r '._meta.v // 0' "$CONF" 2>/dev/null || printf '0')
+    v=$(cat "$MODEL_VER_FILE" 2>/dev/null || printf '0')
+    # 老版本把版本戳写在配置里，读一次做兼容
+    [ "$v" = "0" ] && v=$(jq -r '._meta.v // 0' "$CONF" 2>/dev/null || printf '0')
     [ "$v" = "$META_VER" ] && return 0
 
     local new="$CONF_DIR/.config.mig.$$.json"
-    # v2 → v3：clients 改 users（文档写法）、删 alterId、reality dest 改 target
+    # v2 → v3：clients 改 users（文档写法）、删 alterId、reality dest 改 target，
+    # 并剥离非 Xray 字段 _meta
     local filter
-    filter='._meta = ((._meta // {}) + {v: $v}) |
+    filter='
       .inbounds |= map(
         (if .protocol == "vless" then
            (if .settings.clients? != null
@@ -343,11 +347,14 @@ conf_migrate() {
         | (if .streamSettings.realitySettings.dest? != null
            then ((.streamSettings.realitySettings.target = .streamSettings.realitySettings.dest) | del(.streamSettings.realitySettings.dest))
            else . end)
-      )'
-    if jq --argjson v "$META_VER" "$filter" "$CONF" > "$new" 2>/dev/null; then
+        | del(._meta)
+      )
+      | del(._meta)'
+    if jq "$filter" "$CONF" > "$new" 2>/dev/null; then
         chmod 600 "$new" 2>/dev/null
         mv -f "$new" "$CONF" 2>/dev/null || rm -f "$new"
         chown xray:xray "$CONF" 2>/dev/null || true
+        printf '%s\n' "$META_VER" > "$MODEL_VER_FILE" 2>/dev/null || true
     else
         rm -f "$new"
     fi
@@ -372,7 +379,8 @@ ensure_xray_user() {
 init_env() {
     ensure_xray_user
     if [ ! -s "$CONF" ]; then
-        printf '%s\n' '{"log":{"loglevel":"warning"},"inbounds":[],"outbounds":[{"protocol":"freedom","tag":"direct"},{"protocol":"blackhole","tag":"block"}],"routing":{"domainStrategy":"IPIfNonMatch","rules":[{"type":"field","ip":["10.0.0.0/8","172.16.0.0/12","192.168.0.0/16","127.0.0.0/8","fc00::/7","fe80::/10"],"outboundTag":"block"}]},"_meta":{"v":'"$META_VER"'}}' > "$CONF"
+        printf '%s\n' '{"log":{"loglevel":"warning"},"inbounds":[],"outbounds":[{"protocol":"freedom","tag":"direct"},{"protocol":"blackhole","tag":"block"}],"routing":{"domainStrategy":"IPIfNonMatch","rules":[{"type":"field","ip":["10.0.0.0/8","172.16.0.0/12","192.168.0.0/16","127.0.0.0/8","fc00::/7","fe80::/10"],"outboundTag":"block"}]}}' > "$CONF"
+        printf '%s\n' "$META_VER" > "$MODEL_VER_FILE" 2>/dev/null || true
         chown -R xray:xray "$CONF_DIR" 2>/dev/null || true
         chmod 600 "$CONF" 2>/dev/null || true
     fi
@@ -631,13 +639,22 @@ p_field() {
 }
 
 # ── p_info：所有协议共用同一个 jq 输出契约 ──────────────────
+# 从 REALITY 私钥推导公钥（xray x25519 -i 同时输出私钥与公钥）
+reality_pubkey() {
+    local priv="$1"
+    [ -z "$priv" ] && return 0
+    "$BIN" x25519 -i "$priv" 2>/dev/null \
+        | awk -F': *' '/[Pp]ublic[ ]?[Kk]ey/{print $2}' | tr -d ' \r\n'
+}
+
 p_info_vless() {
-    jq -r --arg host "${2:-}" '
+    local pbk
+    pbk=$(reality_pubkey "$(jq -r '.streamSettings.realitySettings.privateKey // ""' <<< "$1" 2>/dev/null)")
+    jq -r --arg host "${2:-}" --arg pbk "${pbk:--}" '
         . as $n |
-        (.streamSettings.realitySettings.serverNames[0] // ._meta.sni // "-") as $sni |
+        (.streamSettings.realitySettings.serverNames[0] // "-") as $sni |
         (.settings.users[0].id // .settings.clients[0].id // "-") as $uid |
         (.streamSettings.realitySettings.shortIds[0] // "-") as $sid |
-        (._meta.pbk // "-") as $pbk |
         (.streamSettings.network // "tcp") as $net |
         (.settings.clients[0].flow // "xtls-rprx-vision") as $flow |
         (.streamSettings.xhttpSettings.path // "/xhttp") as $path |
@@ -659,7 +676,7 @@ p_info_vless() {
 p_info_hysteria() {
     jq -r --arg host "${2:-}" '
         . as $n |
-        (.streamSettings.tlsSettings.serverName // ._meta.sni // "-") as $sni |
+        (.streamSettings.tlsSettings.serverName // "-") as $sni |
         (.settings.users[0].auth // "-") as $pass |
         ($n.tag // "node") as $tag |
         (if $host == "" then "" else
@@ -713,16 +730,15 @@ p_gen_vless() {
 }
 
 p_gen_vless_tcp() {
-    local port keys priv pub sid uid
+    local port keys priv sid uid
     port=$(ask_port "监听端口" "$(def_port vless)" "" tcp) || return 1
     keys=$("$BIN" x25519 2>/dev/null)
     priv=$(printf '%s\n' "$keys" | awk -F': *' '/[Pp]rivate[ ]?[Kk]ey/{print $2}' | tr -d ' \r\n')
-    pub=$(printf '%s\n' "$keys" | awk -F': *' '/[Pp]ublic[ ]?[Kk]ey/{print $2}' | tr -d ' \r\n')
     [ -z "$priv" ] && { err "生成 Reality 密钥对失败"; return 1; }
     sid=$(openssl rand -hex 4)
     uid=$(gen_uuid)
 
-    jq -n --arg port "$port" --arg uid "$uid" --arg priv "$priv" --arg pbk "$pub" \
+    jq -n --arg port "$port" --arg uid "$uid" --arg priv "$priv" \
           --arg sni "www.apache.org" --arg sid "$sid" --arg rmk "VLESS-${port}" '
         { listen: "::", port: ($port | tonumber), protocol: "vless", tag: $rmk,
           settings: { users: [ { id: $uid, flow: "xtls-rprx-vision", level: 0, email: ($rmk + "@xraym") } ],
@@ -730,14 +746,13 @@ p_gen_vless_tcp() {
           streamSettings: { network: "tcp", security: "reality",
               realitySettings: { show: false, target: ($sni + ":443"), xver: 0,
                                  serverNames: [$sni], privateKey: $priv, shortIds: [$sid] } },
-          sniffing: { enabled: true, destOverride: ["http", "tls", "quic"] },
-          _meta: { pbk: $pbk } }
+          sniffing: { enabled: true, destOverride: ["http", "tls", "quic"] } }
     '
 }
 
 # XHTTP：VLESS + REALITY + XHTTP 传输，不需要 flow
 p_gen_xhttp() {
-    local port keys priv pub sid uid path
+    local port keys priv sid uid path
     port=$(ask_port "监听端口" "$(def_port xhttp)" "" tcp) || return 1
     keys=$("$BIN" x25519 2>/dev/null)
     priv=$(printf '%s\n' "$keys" | awk -F': *' '/[Pp]rivate[ ]?[Kk]ey/{print $2}' | tr -d ' \r\n')
@@ -755,8 +770,7 @@ p_gen_xhttp() {
               xhttpSettings: { path: $path, mode: "auto" },
               realitySettings: { show: false, target: ($sni + ":443"), xver: 0,
                                  serverNames: [$sni], privateKey: $priv, shortIds: [$sid] } },
-          sniffing: { enabled: true, destOverride: ["http", "tls", "quic"] },
-          _meta: { pbk: $pbk } }
+          sniffing: { enabled: true, destOverride: ["http", "tls", "quic"] } }
     '
 }
 
@@ -776,8 +790,7 @@ p_gen_hysteria() {
                   masquerade: { type: "proxy", url: "https://www.apache.org/", rewriteHost: true } },
               tlsSettings: { certificates: [ { certificateFile: $crt, keyFile: $key } ],
                              alpn: ["h3"], serverName: $sni } },
-          sniffing: { enabled: true, destOverride: ["http", "tls", "quic"] },
-          _meta: { sni: $sni } }
+          sniffing: { enabled: true, destOverride: ["http", "tls", "quic"] } }
     '
 }
 
@@ -831,7 +844,7 @@ p_edit_vless() {
 p_edit_hysteria() {
     local j="$1" idx="$2" port sni pass cur_sni cur_pass
     port=$(ask_port "监听端口" "$(n_port "$j")" "$idx" udp) || return 1
-    cur_sni=$(jq -r '.streamSettings.tlsSettings.serverName // ._meta.sni // "www.apache.org"' <<< "$j")
+    cur_sni=$(jq -r '.streamSettings.tlsSettings.serverName // "www.apache.org"' <<< "$j")
     cur_pass=$(jq -r '.settings.users[0].auth // ""' <<< "$j")
     sni=$(ask "伪装域名（SNI）" "$cur_sni") || return 1
     pass=$(ask "认证密码" "$cur_pass") || return 1
@@ -841,8 +854,7 @@ p_edit_hysteria() {
         .port = ($p | tonumber) |
         .tag = (.tag | sub("-[0-9]+$"; "-" + $p)) |
         .settings.users[0].auth = $pass |
-        .streamSettings.tlsSettings.serverName = $sni |
-        ._meta.sni = $sni
+        .streamSettings.tlsSettings.serverName = $sni
     ' <<< "$j"
 }
 
