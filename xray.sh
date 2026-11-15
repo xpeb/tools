@@ -648,8 +648,9 @@ reality_pubkey() {
 }
 
 p_info_vless() {
-    local pbk
-    pbk=$(reality_pubkey "$(jq -r '.streamSettings.realitySettings.privateKey // ""' <<< "$1" 2>/dev/null)")
+    # $3=1 时才推导公钥：推导要 fork 一次 xray，表格渲染用不到
+    local pbk="-"
+    [ "${3:-}" = "1" ] && pbk=$(reality_pubkey "$(jq -r '.streamSettings.realitySettings.privateKey // ""' <<< "$1" 2>/dev/null)")
     jq -r --arg host "${2:-}" --arg pbk "${pbk:--}" '
         . as $n |
         (.streamSettings.realitySettings.serverNames[0] // "-") as $sni |
@@ -878,7 +879,7 @@ build_link() {
     local j="$1" host="$2" t link
     t=$(n_proto "$j")
     declare -F "p_info_$t" >/dev/null 2>&1 || return 0
-    link=$(p_field "$("p_info_$t" "$j" "$host")" 5)
+    link=$(p_field "$("p_info_$t" "$j" "$host" 1)" 5)
     # 带换行输出：调用方可能连续取多条链接，缺换行会粘成一行
     [ -n "$link" ] && printf '%s\n' "$link"
     return 0
@@ -925,7 +926,7 @@ print_node_card() {
     local j="$1" title="${2:-节点详细信息}" t info link4="" link6=""
     refresh_ips
     t=$(n_proto "$j")
-    info=$("p_info_$t" "$j")
+    info=$("p_info_$t" "$j" "" 1)
 
     printf '\n'
     draw_line "-" "$C_CYAN"
