@@ -27,8 +27,6 @@ SVC_NAME="xray"
 VER_CACHE="$CONF_DIR/.latest_ver"
 SHORTCUT="/usr/local/bin/xraym"
 ASSET_DIR="/usr/local/share/xray"
-META_VER=3
-MODEL_VER_FILE="$CONF_DIR/.model_ver"   # 配置模型版本，不写进 Xray 配置
 
 PUB_IPV4=""
 PUB_IPV6=""
@@ -323,44 +321,6 @@ conf_mutate() {
     ok "配置已校验并成功加载生效"
 }
 
-# 配置模型迁移：升版本戳并按版本改写字段，幂等
-conf_migrate() {
-    [ -s "$CONF" ] || return 0
-    local v
-    v=$(cat "$MODEL_VER_FILE" 2>/dev/null || printf '0')
-    # 老版本把版本戳写在配置里，读一次做兼容
-    [ "$v" = "0" ] && v=$(jq -r '._meta.v // 0' "$CONF" 2>/dev/null || printf '0')
-    [ "$v" = "$META_VER" ] && return 0
-
-    local new="$CONF_DIR/.config.mig.$$.json"
-    # v2 → v3：clients 改 users（文档写法）、删 alterId、reality dest 改 target，
-    # 并剥离非 Xray 字段 _meta
-    local filter
-    filter='
-      .inbounds |= map(
-        (if .protocol == "vless" then
-           (if .settings.clients? != null
-            then ((.settings.users = (.settings.clients | map(del(.alterId)))) | del(.settings.clients))
-            else . end)
-           | (if .settings.users? != null then .settings.users |= map(del(.alterId)) else . end)
-         else . end)
-        | (if .streamSettings.realitySettings.dest? != null
-           then ((.streamSettings.realitySettings.target = .streamSettings.realitySettings.dest) | del(.streamSettings.realitySettings.dest))
-           else . end)
-        | del(._meta)
-      )
-      | del(._meta)'
-    if jq "$filter" "$CONF" > "$new" 2>/dev/null; then
-        chmod 600 "$new" 2>/dev/null
-        mv -f "$new" "$CONF" 2>/dev/null || rm -f "$new"
-        chown xray:xray "$CONF" 2>/dev/null || true
-        printf '%s\n' "$META_VER" > "$MODEL_VER_FILE" 2>/dev/null || true
-    else
-        rm -f "$new"
-    fi
-    return 0
-}
-
 # ── 初始环境 ──────────────────────────────────────────────────────────
 ensure_xray_user() {
     if ! id -u xray >/dev/null 2>&1; then
@@ -380,7 +340,6 @@ init_env() {
     ensure_xray_user
     if [ ! -s "$CONF" ]; then
         printf '%s\n' '{"log":{"loglevel":"warning"},"inbounds":[],"outbounds":[{"protocol":"freedom","tag":"direct"},{"protocol":"blackhole","tag":"block"}],"routing":{"domainStrategy":"IPIfNonMatch","rules":[{"type":"field","ip":["10.0.0.0/8","172.16.0.0/12","192.168.0.0/16","127.0.0.0/8","fc00::/7","fe80::/10"],"outboundTag":"block"}]}}' > "$CONF"
-        printf '%s\n' "$META_VER" > "$MODEL_VER_FILE" 2>/dev/null || true
         chown -R xray:xray "$CONF_DIR" 2>/dev/null || true
         chmod 600 "$CONF" 2>/dev/null || true
     fi
@@ -654,10 +613,10 @@ p_info_vless() {
     jq -r --arg host "${2:-}" --arg pbk "${pbk:--}" '
         . as $n |
         (.streamSettings.realitySettings.serverNames[0] // "-") as $sni |
-        (.settings.users[0].id // .settings.clients[0].id // "-") as $uid |
+        (.settings.users[0].id // "-") as $uid |
         (.streamSettings.realitySettings.shortIds[0] // "-") as $sid |
         (.streamSettings.network // "tcp") as $net |
-        (.settings.clients[0].flow // "xtls-rprx-vision") as $flow |
+        (.settings.users[0].flow // "xtls-rprx-vision") as $flow |
         (.streamSettings.xhttpSettings.path // "/xhttp") as $path |
         ($n.tag // "node") as $tag |
         (if $net == "xhttp" then "VLESS-XHTTP" else "VLESS-Vision" end) as $label |
@@ -1372,7 +1331,6 @@ main_menu() {
     setup_shortcut
     refresh_ips
     check_update_async
-    conf_migrate
 
     local c
     while true; do
