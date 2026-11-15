@@ -16,13 +16,45 @@ set -o pipefail
 SCRIPT_SELF="$(readlink -f "${BASH_SOURCE[0]:-$0}" 2>/dev/null || echo "${BASH_SOURCE[0]:-$0}")"
 SCRIPT_LINK="/usr/local/bin/cpapi"
 
-# --- 视觉主题与常量定义 ---
-if [ -t 1 ]; then
-    C_RESET=$'\033[0m' C_BOLD=$'\033[1m' C_CYAN=$'\033[36m'
-    C_GREEN=$'\033[32m' C_YELLOW=$'\033[33m' C_RED=$'\033[31m' C_GRAY=$'\033[90m'
-else
-    C_RESET="" C_BOLD="" C_CYAN="" C_GREEN="" C_YELLOW="" C_RED="" C_GRAY=""
-fi
+# ── 终端样式 ──────────────────────────────────────────────────────────
+C_RESET="\033[0m"; C_BOLD="\033[1m"; C_DIM="\033[2m"
+C_CYAN="\033[36m"; C_GREEN="\033[32m"; C_RED="\033[31m"; C_YELLOW="\033[33m"
+C_GRAY="$C_DIM"
+
+cls() { clear 2>/dev/null || true; }
+
+ok()   { printf '%b[成功]%b %b\n' "$C_GREEN" "$C_RESET" "$*"; }
+err()  { printf '%b[失败]%b %b\n' "$C_RED" "$C_RESET" "$*" >&2; }
+warn() { printf '%b[警告]%b %b\n' "$C_YELLOW" "$C_RESET" "$*"; }
+info() { printf '%b[提示]%b %b\n' "$C_CYAN" "$C_RESET" "$*"; }
+
+draw_line() {
+    local char="${1:--}" color="${2:-}" cols line
+    if [ -n "$__COLS" ]; then
+        cols="$__COLS"
+    else
+        cols=$(tput cols 2>/dev/null || true)
+        case "$cols" in ''|*[!0-9]*) cols="${COLUMNS:-}" ;; esac
+        case "$cols" in ''|*[!0-9]*) cols=75 ;; esac
+        [ "$cols" -lt 30 ] && cols=75
+        [ "$cols" -gt 120 ] && cols=120
+        __COLS="$cols"
+    fi
+    printf -v line '%*s' "$cols" ''
+    line=${line// /"$char"}
+    if [ -n "$color" ]; then printf '%b%s%b\n' "$color" "$line" "$C_RESET"
+    else printf '%s\n' "$line"; fi
+}
+
+pause_tip() { read -rp "$(printf '%b[提示]%b 按回车键继续...' "$C_CYAN" "$C_RESET")" _ || true; }
+
+bye() {
+    cls
+    printf '\n%b[提示]%b %s\n\n' "$C_CYAN" "$C_RESET" "$1"
+    exit 0
+}
+
+__COLS=""
 
 WORK_DIR="/root/cliproxyapi"
 AUTH_DIR="${WORK_DIR}/auth"
@@ -47,20 +79,10 @@ cleanup_tmp() {
 trap cleanup_tmp EXIT INT TERM HUP
 
 # --- UI 输出与安全交互组件 ---
-info()   { echo -e "  ${C_CYAN}›${C_RESET} $*"; }
-ok()     { echo -e "  ${C_GREEN}✔${C_RESET} $*"; }
-warn()   { echo -e "  ${C_YELLOW}!${C_RESET} $*"; }
-err()    { echo -e "  ${C_RED}✖${C_RESET} $*" >&2; }
-kv()     { printf "  ${C_GRAY}%-10s${C_RESET}  %b\n" "$1" "$2"; }
-header() { clear 2>/dev/null || true; echo -e "\n  ${C_BOLD}${1}${C_RESET}\n"; }
+kv()     { printf '%b%-10s%b  %b\n' "$C_GRAY" "$1" "$C_RESET" "$2"; }
+header() { cls; printf '\n%b%s%b\n' "$C_BOLD" "$1" "$C_RESET"; draw_line "-"; }
 
-prompt_read() {
-    if [[ -t 0 ]]; then read -rp "$1" "${2?}"
-    elif [[ -e /dev/tty ]]; then read -rp "$1" "${2?}" < /dev/tty
-    else return 1; fi
-}
-
-pause() { local _; echo ""; prompt_read "  按回车键继续..." _ || true; }
+pause() { pause_tip; }
 
 # --- 0. 权限与环境初始化 ---
 check_root() { [[ "$EUID" -eq 0 ]] || { err "请使用 root 用户运行此脚本！"; exit 1; }; }
@@ -70,6 +92,8 @@ check_os() {
     . /etc/os-release
     OS_ID="${ID,,}"
     OS_NAME="${PRETTY_NAME:-$OS_ID}"
+    OS_SHORT="${NAME:-$OS_ID} ${VERSION_ID:-}"
+    OS_SHORT="${OS_SHORT% }"
     case "$OS_ID" in
         debian|ubuntu) SERVICE_PATH="/etc/systemd/system/cliproxy.service" ;;
         alpine)        SERVICE_PATH="/etc/init.d/cliproxy" ;;
@@ -332,10 +356,12 @@ deploy() {
 
     if [[ -x "$BIN_PATH" && -f "$CONFIG_PATH" ]]; then
         warn "检测到已安装 CLIProxyAPI ($(fmt_ver "$(get_local_version)"))"
-        echo -e "  ${C_CYAN}1.${C_RESET} 平滑升级 ${C_GRAY}(保留现有配置与凭据)${C_RESET}"
-        echo -e "  ${C_CYAN}2.${C_RESET} 重新配置 ${C_GRAY}(备份并重写配置)${C_RESET}"
-        echo -e "  ${C_GRAY}0.${C_RESET} 返回\n"
-        local dep_opt; prompt_read "  › 请选择 [0-2, 默认 1]: " dep_opt || return
+        draw_line "-"
+        printf '%b1.%b 平滑升级 %b(保留现有配置与凭据)%b\n' "$C_CYAN" "$C_RESET" "$C_DIM" "$C_RESET"
+        printf '%b2.%b 重新配置 %b(备份并重写配置)%b\n' "$C_CYAN" "$C_RESET" "$C_DIM" "$C_RESET"
+        printf '\n%b0. 返回%b\n' "$C_DIM" "$C_RESET"
+        draw_line "-"
+        local dep_opt; read -rp "$(printf '%b[提示]%b 请选择 [0-2，默认 1]: ' "$C_CYAN" "$C_RESET")" dep_opt || return
         case "${dep_opt:-1}" in
             1) upgrade_lossless; return ;;
             2) create_backup "auto" ;;
@@ -353,14 +379,14 @@ deploy() {
     [[ -z "$default_key" ]] && default_key="cpa_$(date +%s)_secret"
 
     while true; do
-        prompt_read "  › 管理密钥 Secret Key [默认: ${default_key}]: " SECRET_KEY || return 1
+        read -rp "$(printf '%b[提示]%b 管理密钥 Secret Key [默认: ${default_key}]: ' "$C_CYAN" "$C_RESET")"  SECRET_KEY || return 1
         SECRET_KEY=${SECRET_KEY:-$default_key}
         [[ ! "$SECRET_KEY" =~ [[:cntrl:]] ]] && break
         err "密钥不能包含控制字符，请重新输入！"
     done
 
     while true; do
-        prompt_read "  › 反代域名 (如 api.example.com，留空跳过) [${old_domain:+默认: $old_domain}]: " raw_domain || return 1
+        read -rp "$(printf '%b[提示]%b 反代域名 (如 api.example.com，留空跳过) [${old_domain:+默认: $old_domain}]: ' "$C_CYAN" "$C_RESET")"  raw_domain || return 1
         PROXY_DOMAIN=$(sanitize_domain "${raw_domain:-$old_domain}") && break
         err "域名格式无效，请重新输入！"
     done
@@ -370,7 +396,7 @@ deploy() {
     svc_ctl stop || true
 
     local update_bin="y"
-    [[ -x "$BIN_PATH" ]] && { prompt_read "  › 是否更新主程序至官方最新版？[Y/n]: " update_bin || return 1; }
+    [[ -x "$BIN_PATH" ]] && { read -rp "$(printf '%b[提示]%b 是否更新主程序至官方最新版？[Y/n]: ' "$C_CYAN" "$C_RESET")" update_bin || return 1; }
     if [[ ! "$update_bin" =~ ^[nN]$ ]]; then
         fetch_release_info && install_release_binary || { pause; return 1; }
     fi
@@ -464,10 +490,10 @@ upgrade_lossless() {
 
     if [[ "$local_ver" == "$LATEST_VER" ]]; then
         ok "当前已是最新版本。"
-        prompt_read "  › 是否强制重新下载覆盖安装？[y/N]: " confirm_up || return 0
+        read -rp "$(printf '%b[提示]%b 是否强制重新下载覆盖安装？[y/N]: ' "$C_CYAN" "$C_RESET")"  confirm_up || return 0
         [[ "$confirm_up" =~ ^[yY]$ ]] || return 0
     else
-        prompt_read "  › 确认平滑升级至 v${LATEST_VER}？[Y/n]: " confirm_up || return 0
+        read -rp "$(printf '%b[提示]%b 确认平滑升级至 v${LATEST_VER}？[Y/n]: ' "$C_CYAN" "$C_RESET")"  confirm_up || return 0
         [[ ! "$confirm_up" =~ ^[nN]$ ]] || return 0
     fi
 
@@ -502,7 +528,7 @@ rollback() {
         printf "  ${C_CYAN}%2d.${C_RESET} %-40s %b\n" "$((idx++))" "$(basename "$f")" "$(fmt_ver "$bver")"
     done
     echo -e "\n  ${C_GRAY} 0.${C_RESET} 取消并返回\n"
-    prompt_read "  › 请选择备份编号 [0-${#list[@]}]: " choice || return 0
+    read -rp "$(printf '%b[提示]%b 请选择备份编号 [0-${#list[@]}]: ' "$C_CYAN" "$C_RESET")"  choice || return 0
     [[ -z "$choice" || "$choice" == "0" ]] && return 0
     if [[ ! "$choice" =~ ^[0-9]+$ ]] || (( choice < 1 || choice > ${#list[@]} )); then
         err "编号无效！"; pause; return 1
@@ -526,16 +552,16 @@ view_status() {
     kv "反代域名" "${cur_domain:+${C_CYAN}https://${cur_domain}${C_RESET}}${cur_domain:-${C_GRAY}未设置${C_RESET}}"
     kv "授权凭据" "${C_GREEN}$(auth_file_count)${C_RESET} 个 ${C_GRAY}(${AUTH_DIR})${C_RESET}"
     kv "配置文件" "${CONFIG_PATH}"
-    echo -e "\n  ${C_BOLD}本地端口监听套接字:${C_RESET}"
+    printf '\n%b本地端口监听套接字:%b\n' "$C_BOLD" "$C_RESET"
 
     command -v ss &>/dev/null && net_cmd="ss" || { command -v netstat &>/dev/null && net_cmd="netstat"; }
     if [[ -n "$net_cmd" ]]; then
         "$net_cmd" -tulpn 2>/dev/null | grep -iE ":${LOCKED_PORT}([[:space:]]|$)|cli-proxy" | sed 's/^/  /' \
-            || echo -e "  ${C_GRAY}(当前未检测到监听进程)${C_RESET}"
+            || printf '%b(当前未检测到监听进程)%b\n' "$C_GRAY" "$C_RESET"
     elif (echo >/dev/tcp/"$LOCKED_HOST"/"$LOCKED_PORT") 2>/dev/null; then
-        echo -e "  ${C_GREEN}tcp  LISTEN  ${LISTEN_ADDR}${C_RESET} ${C_GRAY}(通过 /dev/tcp 探测可达)${C_RESET}"
+        printf '%btcp  LISTEN  %s%b %b(通过 /dev/tcp 探测可达)%b\n' "$C_GREEN" "$LISTEN_ADDR" "$C_RESET" "$C_GRAY" "$C_RESET"
     else
-        echo -e "  ${C_GRAY}(当前未检测到监听端口)${C_RESET}"
+        printf '%b(当前未检测到监听端口)%b\n' "$C_GRAY" "$C_RESET"
     fi
     pause
 }
@@ -556,13 +582,15 @@ view_logs() {
 backup_manage() {
     while true; do
         header "备份与还原管理"
-        echo -e "  ${C_CYAN}1.${C_RESET} 创建完整备份  ${C_GRAY}(归档配置、凭据与主程序)${C_RESET}"
-        echo -e "  ${C_CYAN}2.${C_RESET} 还原配置文件  ${C_GRAY}(恢复历史 config.yaml 并锁定本地端口)${C_RESET}"
-        echo -e "  ${C_CYAN}3.${C_RESET} 查看备份列表  ${C_GRAY}(查看 ${BACKUP_DIR})${C_RESET}"
-        echo -e "  ${C_RED}4.${C_RESET} 清空历史备份  ${C_GRAY}(删除所有备份归档)${C_RESET}\n"
-        echo -e "  ${C_GRAY}0.${C_RESET} 返回主菜单\n"
+        draw_line "-"
+        printf '%b1.%b 创建完整备份 %b(归档配置、凭据与主程序)%b\n' "$C_CYAN" "$C_RESET" "$C_DIM" "$C_RESET"
+        printf '%b2.%b 还原配置文件 %b(恢复历史 config.yaml 并锁定本地端口)%b\n' "$C_CYAN" "$C_RESET" "$C_DIM" "$C_RESET"
+        printf '%b3.%b 查看备份列表 %b(%s)%b\n' "$C_CYAN" "$C_RESET" "$C_DIM" "$BACKUP_DIR" "$C_RESET"
+        printf '%b4.%b 清空历史备份 %b(删除所有备份归档)%b\n' "$C_RED" "$C_RESET" "$C_DIM" "$C_RESET"
+        printf '\n%b0. 返回%b\n' "$C_DIM" "$C_RESET"
+        draw_line "-"
 
-        local bopt; prompt_read "  › 请选择 [0-4]: " bopt || return
+        local bopt; read -rp "$(printf '%b[提示]%b 请选择: ' "$C_CYAN" "$C_RESET")" bopt || return
         case "$bopt" in
             1) create_backup "manual"; ok "完整备份已保存至: ${BACKUP_DIR}"; pause ;;
             2)
@@ -572,7 +600,7 @@ backup_manage() {
                 echo ""
                 for f in "${baks[@]}"; do printf "  ${C_CYAN}%2d.${C_RESET} %s\n" "$((i++))" "$(basename "$f")"; done
                 echo ""
-                prompt_read "  › 请选择要恢复的编号 [0 取消]: " pick || continue
+                read -rp "$(printf '%b[提示]%b 请选择要恢复的编号 [0 取消]: ' "$C_CYAN" "$C_RESET")"  pick || continue
                 [[ -z "$pick" || "$pick" == "0" ]] && continue
                 if [[ "$pick" =~ ^[0-9]+$ ]] && (( pick >= 1 && pick <= ${#baks[@]} )); then
                     cp -f "${baks[$((pick-1))]}" "$CONFIG_PATH" && enforce_local_binding
@@ -595,7 +623,7 @@ backup_manage() {
                 (( found_files == 0 )) && info "当前暂无任何备份文件。"
                 pause ;;
             4)
-                local cfm; prompt_read "  确认清空所有备份归档？[y/N]: " cfm || continue
+                local cfm; read -rp "$(printf '%b[提示]%b 确认清空所有备份归档？[y/N]: ' "$C_CYAN" "$C_RESET")" cfm || continue
                 if [[ "$cfm" =~ ^[yY]$ ]]; then rm -rf "${BACKUP_DIR:?}"/* 2>/dev/null; ok "备份已清空。"
                 else info "已取消。"; fi
                 pause ;;
@@ -608,7 +636,7 @@ uninstall_cliproxy() {
     header "卸载与清理"
     warn "即将移除系统服务、主程序、配置文件及备份归档。"
     local confirm del_auth
-    prompt_read "  确认卸载 CLIProxyAPI？[y/N]: " confirm || return 0
+    read -rp "$(printf '%b[提示]%b 确认卸载 CLIProxyAPI？[y/N]: ' "$C_CYAN" "$C_RESET")"  confirm || return 0
     [[ "$confirm" =~ ^[yY]$ ]] || return 0
 
     svc_ctl stop || true
@@ -623,7 +651,7 @@ uninstall_cliproxy() {
     rm -rf "$BACKUP_DIR"
 
     if (( $(auth_file_count) > 0 )); then
-        prompt_read "  是否同时删除 ${AUTH_DIR} 下的所有授权凭据？[y/N]: " del_auth || del_auth="n"
+        read -rp "$(printf '%b[提示]%b 是否同时删除 ${AUTH_DIR} 下的所有授权凭据？[y/N]: ' "$C_CYAN" "$C_RESET")"  del_auth || del_auth="n"
         if [[ "$del_auth" =~ ^[yY]$ ]]; then
             rm -rf "$WORK_DIR"
             ok "已彻底卸载并清理全部凭据。"
@@ -645,7 +673,7 @@ proxy_guide() {
     kv "当前域名" "${cur_domain:-未设置}"
     echo ""
 
-    prompt_read "  › 输入/更新反代域名 (回车保持 [${cur_domain:-api.example.com}]): " raw_domain || true
+    read -rp "$(printf '%b[提示]%b 输入/更新反代域名 (回车保持 [${cur_domain:-api.example.com}]): ' "$C_CYAN" "$C_RESET")"  raw_domain || true
     if [[ -n "$raw_domain" ]]; then
         if new_domain=$(sanitize_domain "$raw_domain") && [[ -n "$new_domain" ]]; then
             mkdir -p "$WORK_DIR" && chmod 700 "$WORK_DIR"
@@ -658,7 +686,7 @@ proxy_guide() {
     fi
     local d="${cur_domain:-api.example.com}"
 
-    echo -e "\n  ${C_BOLD}▸ 方案 A：Caddy 配置 (/etc/caddy/Caddyfile)${C_RESET}\n"
+    printf '\n%b▸ 方案 A：Caddy 配置 (/etc/caddy/Caddyfile)%b\n\n' "$C_BOLD" "$C_RESET"
     cat << CADDY
 ${d} {
     # 可选安全加固：限制管理后台仅指定 IP 可访问
@@ -674,7 +702,7 @@ ${d} {
 }
 CADDY
 
-    echo -e "\n  ${C_BOLD}▸ 方案 B：Nginx 配置 (支持 SSE 流式输出与 WebSocket)${C_RESET}\n"
+    printf '\n%b▸ 方案 B：Nginx 配置 (支持 SSE 流式输出与 WebSocket)%b\n\n' "$C_BOLD" "$C_RESET"
     cat << NGINX
 map \$http_upgrade \$connection_upgrade {
     default upgrade;
@@ -724,27 +752,45 @@ main() {
     check_os
     setup_shortcut
 
+    local cur_dom dom_badge ver
+    cur_dom=$(get_domain)
+    dom_badge="${cur_dom:-未绑定}"
+    ver=$(get_local_version)
+
     while true; do
-        clear 2>/dev/null || true
-        echo ""
-        local cur_dom dom_badge
-        cur_dom=$(get_domain)
-        dom_badge="${cur_dom:+${C_CYAN}${cur_dom}${C_RESET}}"
-        dom_badge="${dom_badge:-${C_GRAY}未绑定${C_RESET}}"
+        cls
+        if [[ "$ver" =~ ^(未安装|未知)$ ]]; then
+            printf '%bCLIProxyAPI%b %s | 快捷命令: %bcpapi%b\n' \
+                "$C_BOLD" "$C_RESET" "$(fmt_status)" "$C_CYAN" "$C_RESET"
+        else
+            printf '%bCLIProxyAPI%b %s %s | 快捷命令: %bcpapi%b\n' \
+                "$C_BOLD" "$C_RESET" "$(fmt_status)" "$(fmt_ver "$ver")" "$C_CYAN" "$C_RESET"
+        fi
+        printf '%b%s | %s | 域名: %s | 凭据: %s 个%b\n' \
+            "$C_DIM" "${OS_SHORT:-${OS_NAME:-Linux}}" "$LISTEN_ADDR" "$dom_badge" "$(auth_file_count)" "$C_RESET"
+        draw_line "-"
 
-        echo -e "  ${C_BOLD}CLIPROXY API${C_RESET}  $(fmt_status) $(fmt_ver "$(get_local_version)")  ${C_GRAY}(快捷命令: ${C_CYAN}cpapi${C_GRAY})${C_RESET}"
-        echo -e "  ${C_GRAY}${OS_NAME} · ${LISTEN_ADDR} · 域名: ${dom_badge}${C_GRAY} · 凭据: $(auth_file_count) 个${C_RESET}\n"
+        printf '%b[服务]%b\n' "$C_DIM" "$C_RESET"
+        printf '%b1.%b 启动服务\n' "$C_CYAN" "$C_RESET"
+        printf '%b2.%b 停止服务\n' "$C_CYAN" "$C_RESET"
+        printf '%b3.%b 重启服务\n' "$C_CYAN" "$C_RESET"
+        printf '%b4.%b 实时日志\n' "$C_CYAN" "$C_RESET"
+        printf '\n%b[核心]%b\n' "$C_DIM" "$C_RESET"
+        printf '%b5.%b 安装部署\n' "$C_CYAN" "$C_RESET"
+        printf '%b6.%b 平滑升级\n' "$C_CYAN" "$C_RESET"
+        printf '%b7.%b 历史回滚\n' "$C_CYAN" "$C_RESET"
+        printf '%b8.%b 状态详情\n' "$C_CYAN" "$C_RESET"
+        printf '\n%b[数据]%b\n' "$C_DIM" "$C_RESET"
+        printf '%b9.%b 备份还原\n' "$C_CYAN" "$C_RESET"
+        printf '%b10.%b 反代指引\n' "$C_CYAN" "$C_RESET"
+        printf '\n%b11.%b 卸载清理\n' "$C_RED" "$C_RESET"
+        printf '\n%b0. 退出%b\n' "$C_DIM" "$C_RESET"
+        draw_line "-"
 
-        echo -e "  ${C_GRAY}服务${C_RESET}    ${C_CYAN}1${C_RESET} 启动服务    ${C_CYAN}2${C_RESET} 停止服务    ${C_CYAN}3${C_RESET} 重启服务    ${C_CYAN}4${C_RESET} 实时日志"
-        echo -e "  ${C_GRAY}核心${C_RESET}    ${C_CYAN}5${C_RESET} 安装部署    ${C_CYAN}6${C_RESET} 平滑升级    ${C_CYAN}7${C_RESET} 历史回滚    ${C_CYAN}8${C_RESET} 状态详情"
-        echo -e "  ${C_GRAY}数据${C_RESET}    ${C_CYAN}9${C_RESET} 备份还原   ${C_CYAN}10${C_RESET} 反代指引"
-        echo -e "  ${C_GRAY}其他${C_RESET}    ${C_GRAY}0${C_RESET} 退出面板   ${C_RED}11${C_RESET} 卸载清理\n"
-
-        local opt; prompt_read "  › 请选择 [1-11, 回车退出]: " opt || exit 0
+        local opt
+        read -rp "$(printf '%b[提示]%b 请选择: ' "$C_CYAN" "$C_RESET")" opt || bye "已退出 CLIProxyAPI 管理面板"
         if [[ -z "$opt" || "$opt" == "0" || "$opt" =~ ^[qQ]$ ]]; then
-            clear 2>/dev/null || true
-            echo -e "\n  ${C_CYAN}已退出 CLIProxyAPI 管理面板${C_RESET} ${C_GRAY}(输入 cpapi 可再次打开)${C_RESET}\n"
-            exit 0
+            bye "已退出 CLIProxyAPI 管理面板（输入 cpapi 可再次打开）"
         fi
 
         case "$opt" in
