@@ -26,7 +26,7 @@ err()  { printf '%b[失败]%b %b\n' "$C_RED" "$C_RESET" "$*" >&2; }
 warn() { printf '%b[警告]%b %b\n' "$C_YELLOW" "$C_RESET" "$*"; }
 info() { printf '%b[提示]%b %b\n' "$C_CYAN" "$C_RESET" "$*"; }
 
-INFO="${C_GREEN}[成功]${C_RESET}"; WARN="${C_YELLOW}[警告]${C_RESET}"; ERROR="${C_RED}[失败]${C_RESET}"
+ERROR="${C_RED}[失败]${C_RESET}"   # 仅 transient_error 使用
 
 draw_line() {
     local char="${1:--}" color="${2:-}" cols line
@@ -642,6 +642,29 @@ set_sshd_config() {
     fi
 }
 
+# 批量设置 sshd 参数：$@ 为 key=value
+set_sshd_multi() {
+    local kv
+    for kv in "$@"; do
+        set_sshd_config "${kv%%=*}" "${kv#*=}" || return 1
+    done
+}
+
+# SSH 配置事务：备份 → 应用 → 重启；任一失败则回滚
+ssh_config_apply() {
+    if ! backup_ssh_config; then
+        err "无法备份 SSH 配置，操作已取消"
+        return 1
+    fi
+    if ! set_sshd_multi "$@" || ! restart_sshd; then
+        err "SSH 重启失败，正在恢复原配置"
+        rollback_ssh_config
+        return 1
+    fi
+    commit_ssh_config
+    return 0
+}
+
 restart_sshd() {
     ok "正在检测 SSH 配置文件语法..."
     if command -v sshd &>/dev/null; then
@@ -827,14 +850,9 @@ has_valid_pubkey() {
 }
 
 # ============ Fail2Ban ============
-# 参数读取：优先读 [sshd] 段 → 读不到再读 [DEFAULT] 段
-# 递增参数（bantime.increment/factor/maxtime）只应在 [DEFAULT] 段生效
-get_f2b_conf() {
-    local key=$1
-    [ -f "$JAIL_CONF" ] || return
-    # 1. 先读 [sshd] 段
-    local result
-    result=$(awk -v t="$TARGET_JAIL" -v k="$key" '
+# 读指定段的 key 值（段内最后一次出现者为准）
+_f2b_read_kv() {
+    awk -v t="$1" -v k="$2" '
         BEGIN { in_block=0; result="" }
         $0 ~ "^[[:space:]]*\\[" t "\\][[:space:]]*$" { in_block=1; next }
         /^[[:space:]]*\[/ { in_block=0 }
@@ -845,28 +863,29 @@ get_f2b_conf() {
             result = value
         }
         END { if (result != "") print result }
-    ' "$JAIL_CONF")
-    # 2. [sshd] 段没有 → 从 [DEFAULT] 段取
-    if [ -z "$result" ]; then
-        result=$(awk -v k="$key" '
-            BEGIN { in_block=0; result="" }
-            /^[[:space:]]*\[DEFAULT\][[:space:]]*$/ { in_block=1; next }
-            /^[[:space:]]*\[/ { in_block=0 }
-            in_block && $0 ~ "^[[:space:]]*" k "[[:space:]]*=" {
-                value=$0
-                sub(/^[[:space:]]*[^=]+=[[:space:]]*/, "", value)
-                sub(/[[:space:]]+$/, "", value)
-                result = value
-            }
-            END { if (result != "") print result }
-        ' "$JAIL_CONF")
-    fi
-    echo "$result"
+    ' "$JAIL_CONF"
+}
+
+# 参数读取：优先 [sshd] 段 → 读不到再读 [DEFAULT] 段
+# 递增参数（bantime.increment/factor/maxtime）只应在 [DEFAULT] 段生效
+get_f2b_conf() {
+    local key=$1 result
+    [ -f "$JAIL_CONF" ] || return
+    result=$(_f2b_read_kv "$TARGET_JAIL" "$key")
+    [ -z "$result" ] && result=$(_f2b_read_kv DEFAULT "$key")
+    printf '%s\n' "$result"
 }
 
 # 参数写入：
 # - bantime.increment / bantime.factor / bantime.maxtime / dbfile / dbpurgeage 属于 [DEFAULT] 段
 # - 其余参数写入 [sshd] 段
+# 写入失败时的统一清理：删临时文件，若本次新建了备份则还原并回收
+_f2b_write_abort() {
+    rm -f "$1"
+    [ "${2:-0}" -eq 1 ] && { restore_f2b_config; commit_f2b_config; }
+    return 1
+}
+
 set_f2b_conf() {
     local key="$1" val="$2" target_section="$TARGET_JAIL"
     local tmpf input_file backup_created=0
@@ -880,15 +899,12 @@ set_f2b_conf() {
         backup_f2b_config || return 1
         backup_created=1
     fi
-    tmpf=$(mktemp "$VPS_RUNTIME_DIR/f2b-config.XXXXXX") || {
-        [ "$backup_created" -eq 1 ] && { restore_f2b_config; commit_f2b_config; }
-        return 1
-    }
+    tmpf=$(mktemp "$VPS_RUNTIME_DIR/f2b-config.XXXXXX") || tmpf=""
     input_file="$JAIL_CONF"
     [ -f "$input_file" ] || input_file=/dev/null
     # 一次 awk 完成 section/key 的插入或替换，再通过原子写入替换配置；
     # 不再把用户输入拼接进 sed 表达式，也不会留下半写入的 jail.local。
-    if ! awk -v t="$target_section" -v k="$key" -v v="$val" '
+    awk -v t="$target_section" -v k="$key" -v v="$val" '
         BEGIN { in_target=0; section_seen=0; key_written=0 }
         /^[[:space:]]*\[/ {
             if (in_target && !key_written) print k " = " v
@@ -920,16 +936,8 @@ set_f2b_conf() {
             if (in_target && !key_written) print k " = " v
             if (!section_seen) print "\n[" t "]\n" k " = " v
         }
-    ' "$input_file" 2>/dev/null > "$tmpf"; then
-        rm -f "$tmpf"
-        [ "$backup_created" -eq 1 ] && { restore_f2b_config; commit_f2b_config; }
-        return 1
-    fi
-    if ! atomic_write_file "$JAIL_CONF" < "$tmpf"; then
-        rm -f "$tmpf"
-        [ "$backup_created" -eq 1 ] && { restore_f2b_config; commit_f2b_config; }
-        return 1
-    fi
+    ' "$input_file" 2>/dev/null > "$tmpf" || { _f2b_write_abort "$tmpf" "$backup_created"; return 1; }
+    atomic_write_file "$JAIL_CONF" < "$tmpf" || { _f2b_write_abort "$tmpf" "$backup_created"; return 1; }
     rm -f "$tmpf"
 
     if command -v fail2ban-client &>/dev/null && ! fail2ban-client -t >/dev/null 2>&1; then
@@ -940,6 +948,17 @@ set_f2b_conf() {
     fi
     [ "$backup_created" -eq 1 ] && commit_f2b_config
     return 0
+}
+
+# 轮询等待 Fail2Ban 就绪（首次启动可能稍慢）
+wait_f2b_ready() {
+    local i=0
+    while [ "$i" -lt 5 ]; do
+        fail2ban-client ping >/dev/null 2>&1 && return 0
+        i=$((i + 1))
+        [ "$i" -lt 5 ] && sleep 1
+    done
+    return 1
 }
 
 restart_f2b() {
@@ -1088,6 +1107,15 @@ migrate_f2b_increment() {
     done
 }
 
+# Fail2Ban 依赖包：非 systemd 环境需要 rsyslog 提供日志
+f2b_packages() {
+    case "$PKG_MGR" in
+        apt) printf '%s\n' fail2ban python3-systemd
+             [ "$INIT_SYS" != "systemd" ] && printf '%s\n' rsyslog ;;
+        apk) printf '%s\n' fail2ban ;;
+    esac
+}
+
 check_f2b_install() {
     hash -r 2>/dev/null
     if ! command -v fail2ban-client >/dev/null 2>&1; then
@@ -1096,14 +1124,8 @@ check_f2b_install() {
         [[ ! "$install_confirm" =~ ^[Yy]$ ]] && { warn "已取消安装。"; return 1; }
 
         ok "正在安装 Fail2Ban 及相关依赖..."
-        local f2b_pkgs=()
-        case "$PKG_MGR" in
-            apt)
-                f2b_pkgs=("fail2ban" "python3-systemd")
-                [ "$INIT_SYS" != "systemd" ] && f2b_pkgs+=("rsyslog")
-                ;;
-            apk) f2b_pkgs=("fail2ban");;
-        esac
+        local -a f2b_pkgs
+        mapfile -t f2b_pkgs < <(f2b_packages)
 
         if ! pkg_install "${f2b_pkgs[@]}"; then
             err "Fail2Ban 及其依赖安装失败。"
@@ -1151,12 +1173,7 @@ check_f2b_install() {
         fi
 
         # 轮询确认服务真正就绪（首次启动可能稍慢）
-        local f2b_up=0
-        for _ in {1..5}; do
-            if fail2ban-client ping >/dev/null 2>&1; then f2b_up=1; break; fi
-            sleep 1
-        done
-        if [ "$f2b_up" -eq 1 ]; then
+        if wait_f2b_ready; then
             ok "${GREEN}Fail2Ban 安装并启动完成！${RESET}"
         else
             warn "Fail2Ban 已安装，但服务尚未就绪，请稍后手动检查。"
@@ -1176,14 +1193,8 @@ check_f2b_install() {
         case "$f2b_fix_opt" in
             1)
                 ok "正在重新安装 Fail2Ban..."
-                local f2b_pkgs=()
-                case "$PKG_MGR" in
-                    apt)
-                        f2b_pkgs=("fail2ban" "python3-systemd")
-                        [ "$INIT_SYS" != "systemd" ] && f2b_pkgs+=("rsyslog")
-                        ;;
-                    apk) f2b_pkgs=("fail2ban");;
-                esac
+                local -a f2b_pkgs
+                mapfile -t f2b_pkgs < <(f2b_packages)
                 if ! pkg_reinstall "${f2b_pkgs[@]}"; then
                     err "Fail2Ban 修复安装失败。"
                     return 1
@@ -1301,12 +1312,7 @@ check_f2b_install() {
         else
             ok "检测到配置变更，正在启动 Fail2Ban..."
             svc_start fail2ban
-            local f2b_up=0
-            for _ in {1..5}; do
-                if fail2ban-client ping >/dev/null 2>&1; then f2b_up=1; break; fi
-                sleep 1
-            done
-            if [ "$f2b_up" -eq 1 ]; then
+            if wait_f2b_ready; then
                 ok "${GREEN}Fail2Ban 已启动并加载新配置。${RESET}"
             else
                 err "Fail2Ban 启动超时或失败。"
@@ -1318,12 +1324,7 @@ check_f2b_install() {
         if ! fail2ban-client ping >/dev/null 2>&1; then
             warn "Fail2Ban 服务未运行，正在尝试启动..."
             svc_start fail2ban
-            local f2b_up=0
-            for _ in {1..5}; do
-                if fail2ban-client ping >/dev/null 2>&1; then f2b_up=1; break; fi
-                sleep 1
-            done
-            if [ "$f2b_up" -eq 1 ]; then
+            if wait_f2b_ready; then
                 ok "${GREEN}Fail2Ban 已启动。${RESET}"
             else
                 err "Fail2Ban 启动超时或失败。"
@@ -1791,15 +1792,8 @@ toggle_pubkey_login() {
         fi
         read -rp "$(printf '%b[提示]%b 是否要启用密钥登录？(y/N，q=取消): ' "$C_CYAN" "$C_RESET")" confirm
         if [[ "$confirm" =~ ^[Yy]$ ]]; then
-            if ! backup_ssh_config; then
-                err "无法备份 SSH 配置，操作已取消。"
-            elif ! set_sshd_config "PubkeyAuthentication" "yes" || ! restart_sshd; then
-                err "SSH 重启失败，正在恢复原配置。"
-                rollback_ssh_config
-            else
-                commit_ssh_config
-                ok "${GREEN}密钥登录已成功启用。${RESET}"
-            fi
+            ssh_config_apply "PubkeyAuthentication=yes" \
+                && ok "${GREEN}密钥登录已成功启用${RESET}"
         fi
     else
         echo -e "\n${YELLOW}${BOLD}[警告] 禁用密钥登录后，如果密码登录也已禁用，你将无法登录 VPS！${RESET}"
@@ -1821,15 +1815,8 @@ toggle_pubkey_login() {
             [[ ! "$confirm" =~ ^[Yy]$ ]] && { ok "已取消操作。"; sleep 1; return; }
         fi
 
-        if ! backup_ssh_config; then
-            err "无法备份 SSH 配置，操作已取消。"
-        elif ! set_sshd_config "PubkeyAuthentication" "no" || ! restart_sshd; then
-            err "SSH 重启失败，正在恢复原配置。"
-            rollback_ssh_config
-        else
-            commit_ssh_config
-            ok "${GREEN}密钥登录已禁用，现在只能通过密码登录。${RESET}"
-        fi
+        ssh_config_apply "PubkeyAuthentication=no" \
+            && ok "${GREEN}密钥登录已禁用，现在只能通过密码登录${RESET}"
     fi
     sleep 1
 }
@@ -1999,18 +1986,12 @@ install_key_menu() {
         esac
 
         if [ "$do_restart" == "1" ]; then
-            if ! backup_ssh_config; then
-                err "无法备份 SSH 配置，正在恢复 authorized_keys。"
-                restore_authorized_keys
-            elif ! set_sshd_config "PubkeyAuthentication" "yes" || ! restart_sshd; then
-                err "SSH 重启失败，正在恢复原 SSH 配置和 authorized_keys。"
-                rollback_ssh_config
-                restore_authorized_keys
-            else
-                commit_ssh_config
+            if ssh_config_apply "PubkeyAuthentication=yes"; then
                 commit_authorized_keys
-                echo -e "${YELLOW}${BOLD}[重点测试]${RESET} ${test_hint}"
-                echo -e "测试成功后，再返回主菜单【禁用密码登录】！"
+                printf '%b[重点测试]%b %s\n' "$C_YELLOW$C_BOLD" "$C_RESET" "$test_hint"
+                printf '测试成功后，再返回主菜单【禁用密码登录】\n'
+            else
+                restore_authorized_keys
             fi
             sleep 1
         fi
@@ -2159,12 +2140,7 @@ toggle_password_login() {
         echo -e "\n当前密码登录已${GREEN}禁用${RESET}。"
         read -rp "$(printf '%b[提示]%b 是否要启用密码登录？(y/N，q=取消): ' "$C_CYAN" "$C_RESET")" confirm
         if [[ "$confirm" =~ ^[Yy]$ ]]; then
-            if ! backup_ssh_config; then
-                err "无法备份 SSH 配置，操作已取消。"
-            elif ! set_sshd_config "PasswordAuthentication" "yes" || ! restart_sshd; then
-                err "SSH 重启失败，正在恢复原配置。"
-                rollback_ssh_config
-            else
+            if ssh_config_apply "PasswordAuthentication=yes"; then
                 local root_login
                 root_login=$(read_sshd_config_val "PermitRootLogin" 2>/dev/null || true)
                 if [[ "${root_login,,}" =~ ^(no|prohibit-password|without-password)$ ]]; then
@@ -2174,8 +2150,7 @@ toggle_password_login() {
                         set_sshd_config "PermitRootLogin" "yes" && restart_sshd
                     fi
                 fi
-                commit_ssh_config
-                ok "已成功启用密码登录。"
+                ok "已成功启用密码登录"
 
                 read -rp "$(printf '%b[提示]%b 是否需要为当前用户 ($(whoami)) 设置新密码？(y/N，q=取消): ' "$C_CYAN" "$C_RESET")" pwd_confirm
                 if [[ "$pwd_confirm" =~ ^[Yy]$ ]]; then
@@ -2208,18 +2183,9 @@ toggle_password_login() {
         fi
         read -rp "$(printf '%b[提示]%b 确认彻底禁用密码登录吗？(y/N，q=取消): ' "$C_CYAN" "$C_RESET")" confirm
         if [[ "$confirm" =~ ^[Yy]$ ]]; then
-            if ! backup_ssh_config; then
-                err "无法备份 SSH 配置，操作已取消。"
-            elif ! set_sshd_config "PasswordAuthentication" "no" || \
-                 ! set_sshd_config "ChallengeResponseAuthentication" "no" || \
-                 ! set_sshd_config "KbdInteractiveAuthentication" "no" || \
-                 ! restart_sshd; then
-                err "SSH 重启失败，正在恢复原配置。"
-                rollback_ssh_config
-            else
-                commit_ssh_config
-                ok "${GREEN}密码登录已成功禁用！现在只能通过密钥登录。${RESET}"
-            fi
+            ssh_config_apply "PasswordAuthentication=no" \
+                "ChallengeResponseAuthentication=no" "KbdInteractiveAuthentication=no" \
+                && ok "${GREEN}密码登录已成功禁用，现在只能通过密钥登录${RESET}"
         fi
     fi
     sleep 1
