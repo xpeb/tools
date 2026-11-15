@@ -113,6 +113,12 @@ pad() {
     printf '%s%*s' "$s" "$n" ''
 }
 
+bye() {
+    cls
+    printf '\n%b[提示]%b 已退出 Xray 管理面板\n\n' "$C_CYAN" "$C_RESET"
+    exit 0
+}
+
 # 长 IPv6 截断，避免顶栏折行
 short_ip() {
     local s="$1"
@@ -854,7 +860,7 @@ p_edit_shadowsocks() {
     ' <<< "$j"
 }
 
-# ── 链接、节点表格、订阅 ──────────────────────────────────────────────
+# ── 链接与节点表格 ───────────────────────────────────────────────────
 
 build_link() {
     local j="$1" host="$2" t link
@@ -1132,33 +1138,37 @@ add_node() {
     pause_tip
 }
 
-edit_node() {
+# 选一个节点序号：成功时输出序号，取消或没有节点返回 1
+pick_node_index() {
+    local title="$1" empty="$2" n sel
     conf_exists || { err "配置文件不存在"; sleep 1; return 1; }
-    local n
     n=$(conf_count)
-    [ "$n" -eq 0 ] && { info "当前暂无配置节点可修改"; sleep 1; return 0; }
+    [ "$n" -eq 0 ] && { info "$empty"; sleep 1; return 1; }
 
-    printf '\n%b修改节点%b\n' "$C_BOLD" "$C_RESET"
-    render_node_table
-    printf '\n'
+    # 展示内容必须走 stderr：本函数的 stdout 会被 $(...) 捕获
+    {
+        printf '\n%b%s%b\n' "$C_BOLD" "$title" "$C_RESET"
+        render_node_table
+        printf '\n'
+    } >&2
 
-    local sel
-    sel=$(ask "输入节点序号（回车返回）" "") || return 0
-    [ -z "$sel" ] && return 0
+    sel=$(ask "输入节点序号（回车返回）" "") || return 1
+    [ -z "$sel" ] && return 1
     [[ "$sel" =~ ^[0-9]+$ ]] || { err "序号须为纯数字"; sleep 1; return 1; }
+    printf '%s\n' "$sel"
+}
 
-    local j
+edit_node() {
+    local sel j t new
+    sel=$(pick_node_index "修改节点" "当前暂无配置节点可修改") || return 0
+
     j=$(conf_node "$sel")
     [ -z "$j" ] && { err "序号不存在"; sleep 1; return 1; }
 
-    local t
     t=$(n_proto "$j")
-    if ! declare -F "p_edit_$t" >/dev/null 2>&1; then
-        err "协议 ${t} 暂不支持在线修改"; sleep 1; return 1
-    fi
+    declare -F "p_edit_$t" >/dev/null 2>&1 || { err "协议 ${t} 暂不支持在线修改"; sleep 1; return 1; }
 
-    info "修改节点 [${sel}] ${P_LABEL[$t]:-$t} (直接回车保持不变)"
-    local new
+    info "修改节点 [${sel}] ${P_LABEL[$t]:-$t}（回车保持不变）"
     new=$("p_edit_$t" "$j" "$sel") || { info "已取消"; return 1; }
     [ -z "$new" ] && { err "生成新配置失败"; return 1; }
 
@@ -1169,21 +1179,9 @@ edit_node() {
 }
 
 delete_node() {
-    conf_exists || { err "配置文件不存在"; sleep 1; return 1; }
-    local n
-    n=$(conf_count)
-    [ "$n" -eq 0 ] && { info "当前暂无配置节点可删除"; sleep 1; return 0; }
+    local sel tag answer
+    sel=$(pick_node_index "删除节点" "当前暂无配置节点可删除") || return 0
 
-    printf '\n%b删除节点%b\n' "$C_BOLD" "$C_RESET"
-    render_node_table
-    printf '\n'
-
-    local sel
-    sel=$(ask "输入节点序号（回车返回）" "") || return 0
-    [ -z "$sel" ] && return 0
-    [[ "$sel" =~ ^[0-9]+$ ]] || { err "序号须为纯数字"; sleep 1; return 1; }
-
-    local tag
     tag=$(jq -r --argjson i "$sel" '.inbounds[$i].tag // empty' "$CONF" 2>/dev/null)
     [ -z "$tag" ] && { err "序号不存在"; sleep 1; return 1; }
 
@@ -1372,9 +1370,7 @@ main_menu() {
         draw_line "-"
 
         if ! c=$(ask "请选择操作" "0"); then
-            cls
-            printf '\n%b[提示]%b 已退出 Xray 管理面板\n\n' "$C_CYAN" "$C_RESET"
-            exit 0
+            bye
         fi
 
         case "$c" in
@@ -1386,10 +1382,7 @@ main_menu() {
             6) install_core ;;
             7) enable_bbr; sleep 1 ;;
             8) uninstall_xray ;;
-            0|q|quit)
-                cls
-                printf '\n%b[提示]%b 已退出 Xray 管理面板\n\n' "$C_CYAN" "$C_RESET"
-                exit 0 ;;
+            0|q|quit) bye ;;
             *) err "请输入有效选项 [0-8]"; sleep 0.6 ;;
         esac
     done
