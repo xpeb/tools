@@ -698,12 +698,12 @@ p_gen_vless_tcp() {
     jq -n --arg port "$port" --arg uid "$uid" --arg priv "$priv" \
           --arg sni "www.apache.org" --arg sid "$sid" --arg rmk "VLESS-${port}" '
         { listen: "::", port: ($port | tonumber), protocol: "vless", tag: $rmk,
-          settings: { users: [ { id: $uid, flow: "xtls-rprx-vision", level: 0, email: ($rmk + "@xraym") } ],
+          settings: { users: [ { id: $uid, flow: "xtls-rprx-vision" } ],
                       decryption: "none" },
           streamSettings: { network: "tcp", security: "reality",
-              realitySettings: { show: false, target: ($sni + ":443"), xver: 0,
+              realitySettings: { target: ($sni + ":443"),
                                  serverNames: [$sni], privateKey: $priv, shortIds: [$sid] } },
-          sniffing: { enabled: true, destOverride: ["http", "tls", "quic"] } }
+          sniffing: { enabled: true, destOverride: ["http", "tls"] } }
     '
 }
 
@@ -722,12 +722,12 @@ p_gen_xhttp() {
     jq -n --arg port "$port" --arg uid "$uid" --arg priv "$priv" --arg pbk "$pub" \
           --arg sni "www.apache.org" --arg sid "$sid" --arg path "$path" --arg rmk "XHTTP-${port}" '
         { listen: "::", port: ($port | tonumber), protocol: "vless", tag: $rmk,
-          settings: { users: [ { id: $uid, level: 0, email: ($rmk + "@xraym") } ], decryption: "none" },
+          settings: { users: [ { id: $uid } ], decryption: "none" },
           streamSettings: { network: "xhttp", security: "reality",
               xhttpSettings: { path: $path, mode: "auto" },
-              realitySettings: { show: false, target: ($sni + ":443"), xver: 0,
+              realitySettings: { target: ($sni + ":443"),
                                  serverNames: [$sni], privateKey: $priv, shortIds: [$sid] } },
-          sniffing: { enabled: true, destOverride: ["http", "tls", "quic"] } }
+          sniffing: { enabled: true, destOverride: ["http", "tls"] } }
     '
 }
 
@@ -741,13 +741,13 @@ p_gen_hysteria() {
           --arg key "$CERTS_DIR/priv.key" --arg sni "$sni" --arg rmk "Hy2-${port}" '
         { listen: "::", port: ($port | tonumber), protocol: "hysteria", tag: $rmk,
           settings: { version: 2,
-                      users: [ { auth: $pass, level: 0, email: ($rmk + "@xraym") } ] },
+                      users: [ { auth: $pass } ] },
           streamSettings: { network: "hysteria", security: "tls",
-              hysteriaSettings: { version: 2, udpIdleTimeout: 60,
+              hysteriaSettings: { version: 2,
                   masquerade: { type: "proxy", url: "https://www.apache.org/", rewriteHost: true } },
               tlsSettings: { certificates: [ { certificateFile: $crt, keyFile: $key } ],
                              alpn: ["h3"], serverName: $sni } },
-          sniffing: { enabled: true, destOverride: ["http", "tls", "quic"] } }
+          sniffing: { enabled: true, destOverride: ["http", "tls"] } }
     '
 }
 
@@ -760,7 +760,6 @@ p_gen_shadowsocks() {
     jq -n --arg port "$port" --arg pass "$pass" --arg method "$method" --arg rmk "SS-${port}" '
         { listen: "::", port: ($port | tonumber), protocol: "shadowsocks", tag: $rmk,
           settings: { method: $method, password: $pass, network: "tcp,udp" },
-          streamSettings: { network: "tcp" },
           sniffing: { enabled: true, destOverride: ["http", "tls"] } }
     '
 }
