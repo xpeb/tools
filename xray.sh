@@ -279,6 +279,7 @@ conf_mutate() {
     if ! lock_acquire; then err "另一个会话正在修改配置，请稍后重试"; return 1; fi
 
     local new="$CONF_DIR/.config.new.$$.json"   # 必须带 .json 后缀：Xray 按扩展名判格式
+    TMP_DIRS+=("$new")                          # 异常退出也要清掉，否则永久残留
     if ! jq "$@" "$filter" "$CONF" > "$new" 2>/dev/null; then
         rm -f "$new"; lock_release; err "配置计算失败"; return 1
     fi
@@ -291,7 +292,14 @@ conf_mutate() {
 
     local old_pid
     old_pid=$(svc_pid)
-    [ -f "$CONF" ] && { cp -f "$CONF" "$CONF.bak" 2>/dev/null && chmod 600 "$CONF.bak" 2>/dev/null; }
+    # 备份失败必须中止：rename 只改目录项，磁盘满时 cp 会失败而 mv 会成功，
+    # 那样新配置顶上去、旧配置没了，回滚时无料可恢复。
+    rm -f "$CONF.bak" 2>/dev/null || true
+    if ! cp -f "$CONF" "$CONF.bak" 2>/dev/null; then
+        rm -f "$new"; lock_release
+        err "备份当前配置失败，已中止（检查磁盘空间）"; return 1
+    fi
+    chmod 600 "$CONF.bak" 2>/dev/null || true
     sync
 
     if ! mv -f "$new" "$CONF" 2>/dev/null; then
@@ -386,6 +394,11 @@ svc_do() {
         bare)
             pkill -u xray -x xray >/dev/null 2>&1 || true
             pkill -x xray >/dev/null 2>&1 || true
+            # pkill 只是发信号：不等旧进程退出，新进程会绑不上端口然后秒退
+            local w=0
+            while [ -n "$(pgrep -x xray 2>/dev/null | head -n1)" ] && [ "$w" -lt 25 ]; do
+                sleep 0.2; w=$((w + 1))
+            done
             case "$act" in
                 start|restart)
                     [ -x "$BIN" ] || return 0
@@ -713,13 +726,12 @@ p_gen_xhttp() {
     port=$(ask_port "监听端口" "$(def_port xhttp)" "" tcp) || return 1
     keys=$("$BIN" x25519 2>/dev/null)
     priv=$(printf '%s\n' "$keys" | awk -F': *' '/[Pp]rivate[ ]?[Kk]ey/{print $2}' | tr -d ' \r\n')
-    pub=$(printf '%s\n' "$keys" | awk -F': *' '/[Pp]ublic[ ]?[Kk]ey/{print $2}' | tr -d ' \r\n')
     [ -z "$priv" ] && { err "生成 Reality 密钥对失败"; return 1; }
     sid=$(openssl rand -hex 4)
     uid=$(gen_uuid)
     path="/xhttp-$(openssl rand -hex 3)"
 
-    jq -n --arg port "$port" --arg uid "$uid" --arg priv "$priv" --arg pbk "$pub" \
+    jq -n --arg port "$port" --arg uid "$uid" --arg priv "$priv" \
           --arg sni "www.apache.org" --arg sid "$sid" --arg path "$path" --arg rmk "XHTTP-${port}" '
         { listen: "::", port: ($port | tonumber), protocol: "vless", tag: $rmk,
           settings: { users: [ { id: $uid } ], decryption: "none" },
@@ -964,11 +976,31 @@ install_core() {
     if ! unzip -tq "$tmp/x.zip" >/dev/null 2>&1; then
         err "核心包损坏 (zip 完整性校验失败)"; return 1
     fi
+
+    # 官方 .dgst 带 SHA2-256；拿不到就告警继续，不阻断镜像站
+    local want="" got=""
+    if curl -fsSL -m 20 "$url.dgst" -o "$tmp/x.dgst" 2>/dev/null; then
+        want=$(awk -F'= *' '/^SHA2-256=/{print $2}' "$tmp/x.dgst" 2>/dev/null | tr -d ' \r\n')
+    fi
+    if [ -n "$want" ]; then
+        if command -v sha256sum >/dev/null 2>&1; then
+            got=$(sha256sum "$tmp/x.zip" 2>/dev/null | awk '{print $1}')
+        elif command -v shasum >/dev/null 2>&1; then
+            got=$(shasum -a 256 "$tmp/x.zip" 2>/dev/null | awk '{print $1}')
+        fi
+        if [ -n "$got" ] && [ "$got" != "$want" ]; then
+            err "核心包校验和不匹配（期望 ${want}，实际 ${got}）"; return 1
+        fi
+        [ -z "$got" ] && warn "系统缺少 sha256sum，跳过校验和比对"
+    else
+        warn "未取到官方校验和，跳过比对"
+    fi
     unzip -qo "$tmp/x.zip" -d "$tmp" 2>/dev/null || { err "解压失败"; return 1; }
     [ -f "$tmp/xray" ] || { err "核心包内未找到 xray 可执行文件"; return 1; }
     chmod +x "$tmp/xray" 2>/dev/null
     if ! "$tmp/xray" version >/dev/null 2>&1; then
-        err "下载的核心无法在本机运行 (架构不匹配或文件损坏)"; return 1
+        err "下载的核心无法在本机运行（本机 $(uname -m)，选用包 Xray-linux-${ARCH}.zip）"
+        return 1
     fi
 
     local was_running=false
@@ -1017,7 +1049,11 @@ cert_info() {
 
 # ── BBR ────────────────────────────────────────────────────────────
 enable_bbr() {
-    if ! sysctl net.ipv4.tcp_congestion_control 2>/dev/null | grep -qw "bbr"; then
+    local cur_a cur_q
+    cur_a=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || true)
+    cur_q=$(sysctl -n net.core.default_qdisc 2>/dev/null || true)
+    # 只换算法不换 fq，BBR 的发包节流会打折，两个都要
+    if [ "$cur_a" != "bbr" ] || [ "$cur_q" != "fq" ]; then
         printf '%s\n' "net.core.default_qdisc=fq" "net.ipv4.tcp_congestion_control=bbr" \
             > /etc/sysctl.d/99-bbr.conf 2>/dev/null || true
         sysctl -p /etc/sysctl.d/99-bbr.conf >/dev/null 2>&1 || true
@@ -1051,21 +1087,42 @@ setup_shortcut() {
             ;;
     esac
 
-    # 管道运行且本地尚无快捷命令：只从显式来源拉取，不再从 bash_history 猜 URL
+    # 管道运行（bash <(curl ...) / curl | bash）：只从显式来源拉取，不从 bash_history 猜 URL
+    local u
     if [ ! -s "$target" ]; then
-        local u
         for u in "${XRAY_SOURCE_URL:-https://raw.githubusercontent.com/xpeb/vps-tools/main/xray.sh}" \
                  "https://raw.gitmirror.com/xpeb/vps-tools/main/xray.sh"; do
             if curl -fsSL -m 8 "$u" -o "${target}.tmp" 2>/dev/null && bash -n "${target}.tmp" 2>/dev/null; then
-                mv -f "${target}.tmp" "$target" 2>/dev/null
-                chmod +x "$target" 2>/dev/null || true
+                chmod +x "${target}.tmp" 2>/dev/null && mv -f "${target}.tmp" "$target" 2>/dev/null
                 ok "已自动配置快捷命令: ${C_BOLD}xraym${C_RESET}"
                 return 0
             fi
             rm -f "${target}.tmp" 2>/dev/null
         done
+        return 0
     fi
+
+    # 已存在也要比对刷新，否则升级脚本后 xraym 永远停在首次安装的版本
+    shortcut_refresh_async
     return 0
+}
+
+# 后台刷新快捷命令：内容一致就不动，避免每次启动都写盘
+shortcut_refresh_async() {
+    local target="$SHORTCUT" u tmp="${SHORTCUT}.$$.new"
+    (
+        for u in "${XRAY_SOURCE_URL:-https://raw.githubusercontent.com/xpeb/vps-tools/main/xray.sh}" \
+                 "https://raw.gitmirror.com/xpeb/vps-tools/main/xray.sh"; do
+            curl -fsSL -m 15 "$u" -o "$tmp" 2>/dev/null || { rm -f "$tmp"; continue; }
+            bash -n "$tmp" 2>/dev/null || { rm -f "$tmp"; continue; }
+            if command -v cmp >/dev/null 2>&1 && cmp -s "$tmp" "$target"; then
+                rm -f "$tmp"; return 0
+            fi
+            chmod +x "$tmp" 2>/dev/null && mv -f "$tmp" "$target" 2>/dev/null
+            return 0
+        done
+        rm -f "$tmp" 2>/dev/null
+    ) >/dev/null 2>&1 &
 }
 # ── 节点增删改查：菜单只是入口，真正的逻辑都在协议钩子里 ──────────────
 
@@ -1142,7 +1199,7 @@ edit_node() {
 
     if conf_mutate '.inbounds[$i] = $inb' --argjson i "$sel" --argjson inb "$new"; then
         ok "节点 [${sel}] 配置已更新生效"
-        sleep 1
+        printf '\n'; pause_tip
     fi
 }
 
@@ -1153,13 +1210,12 @@ delete_node() {
     tag=$(jq -r --argjson i "$sel" '.inbounds[$i].tag // empty' "$CONF" 2>/dev/null)
     [ -z "$tag" ] && { err "序号不存在"; sleep 1; return 1; }
 
-    local answer
     answer=$(ask "确认删除节点 ${sel}（${tag}）？[y/N]" "n") || return 0
     [[ "$answer" =~ ^[Yy]$ ]] || { info "已取消删除"; sleep 0.8; return 0; }
 
     if conf_mutate 'del(.inbounds[$i])' --argjson i "$sel"; then
         ok "节点 [${sel}] (${tag}) 已删除"
-        sleep 1
+        printf '\n'; pause_tip
     fi
 }
 
@@ -1223,9 +1279,12 @@ manage_service() {
     local c
     c=$(ask "请选择操作" "0") || return 0
     case "$c" in
-        1) if svc_restart_verify "$(svc_pid)"; then ok "服务已重启"; else err "重启失败，请查看日志"; fi; sleep 0.8 ;;
-        2) if svc_stop; then ok "服务已停止"; else err "停止失败"; fi; sleep 0.8 ;;
-        3) if svc_start; then ok "服务已启动"; else err "启动失败，请检查端口与日志"; fi; sleep 0.8 ;;
+        1) if svc_restart_verify "$(svc_pid)"; then ok "服务已重启"; else err "重启失败，请查看日志"; fi
+           printf '\n'; pause_tip ;;
+        2) if svc_stop; then ok "服务已停止"; else err "停止失败"; fi
+           printf '\n'; pause_tip ;;
+        3) if svc_start; then ok "服务已启动"; else err "启动失败，请检查端口与日志"; fi
+           printf '\n'; pause_tip ;;
         4) svc_log ;;
         5) cls; cert_info; printf '\n'; pause_tip ;;
         *) return 0 ;;
@@ -1347,7 +1406,7 @@ main_menu() {
             4) delete_node ;;
             5) manage_service ;;
             6) install_core ;;
-            7) enable_bbr; sleep 1 ;;
+            7) enable_bbr; printf '\n'; pause_tip ;;
             8) uninstall_xray ;;
             0|q|quit) bye ;;
             *) err "请输入有效选项 [0-8]"; sleep 0.6 ;;
