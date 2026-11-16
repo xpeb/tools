@@ -702,8 +702,8 @@ p_gen_vless_tcp() {
                       decryption: "none" },
           streamSettings: { network: "tcp", security: "reality",
               realitySettings: { target: ($sni + ":443"),
-                                 serverNames: [$sni], privateKey: $priv, shortIds: [$sid] } },
-          sniffing: { enabled: true, destOverride: ["http", "tls"] } }
+                                 serverNames: [$sni], privateKey: $priv, shortIds: [$sid] } }
+          }
     '
 }
 
@@ -726,8 +726,8 @@ p_gen_xhttp() {
           streamSettings: { network: "xhttp", security: "reality",
               xhttpSettings: { path: $path, mode: "auto" },
               realitySettings: { target: ($sni + ":443"),
-                                 serverNames: [$sni], privateKey: $priv, shortIds: [$sid] } },
-          sniffing: { enabled: true, destOverride: ["http", "tls"] } }
+                                 serverNames: [$sni], privateKey: $priv, shortIds: [$sid] } }
+          }
     '
 }
 
@@ -746,8 +746,8 @@ p_gen_hysteria() {
               hysteriaSettings: { version: 2,
                   masquerade: { type: "proxy", url: "https://www.apache.org/", rewriteHost: true } },
               tlsSettings: { certificates: [ { certificateFile: $crt, keyFile: $key } ],
-                             alpn: ["h3"], serverName: $sni } },
-          sniffing: { enabled: true, destOverride: ["http", "tls"] } }
+                             alpn: ["h3"], serverName: $sni } }
+          }
     '
 }
 
@@ -759,8 +759,8 @@ p_gen_shadowsocks() {
 
     jq -n --arg port "$port" --arg pass "$pass" --arg method "$method" --arg rmk "SS-${port}" '
         { listen: "::", port: ($port | tonumber), protocol: "shadowsocks", tag: $rmk,
-          settings: { method: $method, password: $pass, network: "tcp,udp" },
-          sniffing: { enabled: true, destOverride: ["http", "tls"] } }
+          settings: { method: $method, password: $pass, network: "tcp,udp" }
+          }
     '
 }
 
