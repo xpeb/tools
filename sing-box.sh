@@ -407,7 +407,7 @@ choose_node() { # 交互选择节点并设置 IDX；取消返回 1
   [[ $n -eq 1 ]] && def=1
   while :; do
     ask "编号（0=返回）" "$def"
-    [[ $REPLY == 0 || $REPLY == q ]] && return 1
+    [[ $REPLY == 0 ]] && return 1
     if [[ $REPLY =~ ^[0-9]{1,4}$ ]] && ((10#$REPLY >= 1 && 10#$REPLY <= n)); then
       IDX=$((10#$REPLY - 1))
       return 0
@@ -565,8 +565,10 @@ menu_add() {
     line
     read -rp "  > " c || return
     [[ -z $c ]] && continue
-    [[ $c == 0 || $c == q ]] && return
-    break
+    [[ $c == 0 ]] && return
+    [[ $c =~ ^[1-6]$ ]] && break
+    err "无效选项"
+    sleep 0.6
   done
   echo
   local n
@@ -574,11 +576,6 @@ menu_add() {
   snapshot
   case $c in
     1) add_socks ;; 2) add_ss ;; 3) add_hy2 ;; 4) add_vless ;; 5) add_anytls ;; 6) add_snell ;;
-    *)
-      err "无效选项"
-      sleep 0.8
-      return
-      ;;
   esac
   if [[ $(jq length "$NODES") -eq $n ]]; then
     return
@@ -673,7 +670,7 @@ menu_links() {
   local i
   while :; do
     ask "编号（a=全部，0=返回）" "a"
-    [[ -z $REPLY || $REPLY == 0 || $REPLY == q ]] && return
+    [[ $REPLY == 0 ]] && return
     if [[ $REPLY == a ]]; then
       echo
       for ((i = 0; i < n; i++)); do show_link "$i"; done
@@ -707,6 +704,15 @@ node_fields() {
       fi
       ;;
   esac
+}
+
+_ask_match() { # $1=提示 $2=默认 $3=原值 $4=正则 $5=错误提示
+  while :; do
+    ask "$1（0=取消）" "$2"
+    [[ $REPLY == 0 || $REPLY == "$3" ]] && return 1
+    [[ $REPLY =~ $4 ]] && return 0
+    err "$5"
+  done
 }
 
 edit_field() {
@@ -837,12 +843,8 @@ edit_field() {
       fi
       ;;
     mode)
-      while :; do
-        ask "模式 default/unshaped/unsafe-raw（0=取消）" "${cur:-default}"
-        [[ $REPLY == 0 || $REPLY == "${cur:-default}" ]] && return 1
-        [[ $REPLY == default || $REPLY == unshaped || $REPLY == unsafe-raw ]] && break
-        err "模式无效"
-      done
+      _ask_match "模式 default/unshaped/unsafe-raw" "${cur:-default}" "${cur:-default}" \
+        '^(default|unshaped|unsafe-raw)$' "模式无效" || return 1
       setf "$IDX" mode "$REPLY"
       ;;
     psk)
@@ -855,21 +857,13 @@ edit_field() {
       setf "$IDX" psk "$REPLY"
       ;;
     uuid)
-      while :; do
-        ask "新 UUID（0=取消）" "$cur"
-        [[ $REPLY == 0 || $REPLY == "$cur" ]] && return 1
-        [[ $REPLY =~ ^[0-9a-fA-F]{8}(-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}$ ]] && break
-        err "UUID 格式无效"
-      done
+      _ask_match "新 UUID" "$cur" "$cur" \
+        '^[0-9a-fA-F]{8}(-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}$' "UUID 格式无效" || return 1
       setf "$IDX" uuid "$REPLY"
       ;;
     sid)
-      while :; do
-        ask "新 ShortID（偶数位十六进制，最长 16 位，0=取消）" "$cur"
-        [[ $REPLY == 0 || $REPLY == "$cur" ]] && return 1
-        [[ $REPLY =~ ^([0-9a-fA-F]{2}){1,8}$ ]] && break
-        err "ShortID 格式无效"
-      done
+      _ask_match "新 ShortID（偶数位十六进制，最长 16 位）" "$cur" "$cur" \
+        '^([0-9a-fA-F]{2}){1,8}$' "ShortID 格式无效" || return 1
       setf "$IDX" sid "$REPLY"
       ;;
     _cert)
@@ -888,12 +882,7 @@ edit_field() {
       sleep 0.8
       ;;
     *)
-      while :; do
-        ask "新值（0=取消）" "$cur"
-        [[ $REPLY == 0 || $REPLY == "$cur" ]] && return 1
-        [[ -n $REPLY ]] && break
-        err "不能为空"
-      done
+      _ask_match "新值" "$cur" "$cur" '.+' "不能为空" || return 1
       setf "$IDX" "$k" "$REPLY"
       ;;
   esac
@@ -926,7 +915,7 @@ menu_edit() {
     line
     read -rp "  > " c || break
     [[ -z $c ]] && continue
-    [[ $c == 0 || $c == q ]] && break
+    [[ $c == 0 ]] && break
     if [[ $c =~ ^[0-9]{1,2}$ ]] && ((10#$c >= 1 && 10#$c <= ${#FIELDS[@]})); then
       echo
       edit_field "${FIELDS[$((10#$c - 1))]%%:*}" && dirty=1
@@ -976,7 +965,7 @@ menu_service() {
     line
     read -rp "  > " c || return
     [[ -z $c ]] && continue
-    [[ $c == 0 || $c == q ]] && return
+    [[ $c == 0 ]] && return
     case $c in
       1) apply ;;
       2)
@@ -1066,7 +1055,7 @@ main_menu() {
         sleep 1
         ;;
       9) uninstall ;;
-      0 | q)
+      0)
         clear
         exit 0
         ;;
