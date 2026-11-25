@@ -215,7 +215,13 @@ install_xray() {
       return 1
       ;;
   esac
-  ver=$(curl -fsSL -m 10 https://api.github.com/repos/XTLS/Xray-core/releases/latest 2>/dev/null | jq -r '.tag_name // empty' | sed 's/^v//')
+  local eff_url=""
+  eff_url=$(curl -fsSLI -m 10 -o /dev/null -w '%{url_effective}' https://github.com/XTLS/Xray-core/releases/latest 2>/dev/null)
+  ver=${eff_url##*/}
+  ver=${ver#v}
+  if [[ -z $ver || $ver == latest ]]; then
+    ver=$(curl -fsSL -m 10 https://api.github.com/repos/XTLS/Xray-core/releases/latest 2>/dev/null | jq -r '.tag_name // empty' | sed 's/^v//')
+  fi
   if [[ -z $ver ]]; then
     err "获取最新版本失败"
     return 1
@@ -224,9 +230,24 @@ install_xray() {
     confirm "是否强制重新安装？" || return 1
   fi
   tmp=$(mktemp -d "$RUN_TMP"/dl.XXXXXX)
-  if ! curl -fsSL -o "$tmp/xr.zip" "https://github.com/XTLS/Xray-core/releases/download/v$ver/Xray-linux-$arch.zip" 2>/dev/null \
-    || ! unzip -qo "$tmp/xr.zip" xray -d "$tmp" 2>/dev/null || ! install -m755 "$tmp/xray" "$XR_BIN" 2>/dev/null; then
-    err "下载或安装失败"
+  local base_url="https://github.com/XTLS/Xray-core/releases/download/v$ver/Xray-linux-$arch.zip"
+  if ! curl -fsSL -o "$tmp/xr.zip" "$base_url" 2>/dev/null; then
+    err "下载失败"
+    rm -rf "$tmp"
+    return 1
+  fi
+  if curl -fsSL -o "$tmp/xr.zip.dgst" "$base_url.dgst" 2>/dev/null; then
+    local expected actual
+    expected=$(awk '/^SHA2-256=/{print $2; exit}' "$tmp/xr.zip.dgst" | tr -d '[:space:]')
+    actual=$(sha256sum "$tmp/xr.zip" | awk '{print $1}')
+    if [[ -n $expected && $expected != "$actual" ]]; then
+      err "安装包 SHA256 校验失败"
+      rm -rf "$tmp"
+      return 1
+    fi
+  fi
+  if ! unzip -qo "$tmp/xr.zip" xray -d "$tmp" 2>/dev/null || ! install -m755 "$tmp/xray" "$XR_BIN" 2>/dev/null; then
+    err "解压或安装失败"
     rm -rf "$tmp"
     return 1
   fi
@@ -353,7 +374,7 @@ apply() {
 # ───────── 通用辅助 ─────────
 rnd() { tr -dc 'A-Za-z0-9' </dev/urandom | head -c "${1:-16}"; }
 valid_port() { [[ $1 =~ ^[0-9]{1,5}$ ]] && ((10#$1 >= 1 && 10#$1 <= 65535)); }
-valid_sni() { [[ -n $1 && ! $1 =~ [[:space:]/\\:] ]]; }
+valid_sni() { [[ $1 =~ ^[A-Za-z0-9.-]+$ && $1 != .* && $1 != *. && $1 != *..* ]]; }
 valid_path() { [[ $1 == /* && ! $1 =~ [[:space:]] ]]; }
 valid_ss2022_psk() {
   local need=16 raw
@@ -650,7 +671,7 @@ list_nodes() {
     info "暂无节点"
     return 1
   }
-  printf "${D}%-4s %-15s %-7s %s${N}\n" "编号" "协议" "端口" "摘要"
+  printf "${D}%-6s %-17s %-9s %s${N}\n" "编号" "协议" "端口" "摘要"
   jq -r 'to_entries[] | [
     (.key+1),
     .value.type,
@@ -700,18 +721,18 @@ build_link() { # $1=raw_ip；单次 jq 完成编码与拼接
 
 show_link() {
   IDX=$1
-  local name host meta
-  meta=$(jq -r --argjson i "$IDX" '(.[$i] // {}) | [(.tag // ""), (.host // "")] | join("\u001f")' "$NODES")
-  IFS=$'\x1f' read -r name host <<<"$meta"
-  printf "${B}%s${N}\n" "$name"
+  local name host ptype port meta
+  meta=$(jq -r --argjson i "$IDX" '(.[$i] // {}) | [(.tag // ""), (.host // ""), (.type // ""), (.port // "" | tostring)] | join("\u001f")' "$NODES")
+  IFS=$'\x1f' read -r name host ptype port <<<"$meta"
+  printf "${C}▸${N} ${B}%s${N}  ${D}%s · %s${N}\n" "$name" "$ptype" "$port"
   if [[ -n $host ]]; then
     printf "${G}%s${N}\n" "$(build_link "$host")"
     return
   fi
   detect_ips
   if [[ -n $PUBIP4 && -n $PUBIP6 ]]; then
-    printf "${D}[IPv4]${N} ${G}%s${N}\n" "$(build_link "$PUBIP4")"
-    printf "${D}[IPv6]${N} ${G}%s${N}\n" "$(build_link "$PUBIP6")"
+    printf "${D}IPv4${N}\n${G}%s${N}\n" "$(build_link "$PUBIP4")"
+    printf "${D}IPv6${N}\n${G}%s${N}\n" "$(build_link "$PUBIP6")"
   elif [[ -n $PUBIP4 ]]; then
     printf "${G}%s${N}\n" "$(build_link "$PUBIP4")"
   elif [[ -n $PUBIP6 ]]; then
@@ -734,7 +755,10 @@ menu_links() {
     [[ $REPLY == 0 ]] && return
     if [[ $REPLY == a ]]; then
       echo
-      for ((i = 0; i < n; i++)); do show_link "$i"; done
+      for ((i = 0; i < n; i++)); do
+        show_link "$i"
+        ((i < n - 1)) && echo
+      done
       break
     fi
     if [[ $REPLY =~ ^[0-9]{1,4}$ ]] && ((10#$REPLY >= 1 && 10#$REPLY <= n)); then
@@ -913,17 +937,30 @@ menu_edit() {
     i=1
     for f in "${FIELDS[@]}"; do
       k=${f%%:*}
+      local label ascii_part w pad
+      label=${f#*:}
       if [[ $k == _* ]]; then
         v=""
       else
         v=$(g "$k")
         [[ -z $v ]] && v="—"
       fi
-      printf "${C}%-2s${N} %-14s ${D}%s${N}\n" "$i" "${f#*:}" "$v"
+      ascii_part=${label//[^ -~]/}
+      w=$((${#label} * 2 - ${#ascii_part}))
+      pad=$((16 - w))
+      ((pad < 1)) && pad=1
+      printf "${C}%-2s${N} %s%*s${D}%s${N}\n" "$i" "$label" "$pad" "" "$v"
       ((i++))
     done
     printf "${C}0${N}  保存并返回\n"
-    read -rp "> " c || break
+    read -rp "> " c || {
+      if [[ $dirty == 1 ]]; then
+        rollback "$BAK" "已取消修改"
+      else
+        PENDING_BAK=""
+      fi
+      return
+    }
     [[ -z $c ]] && continue
     [[ $c == 0 ]] && break
     if [[ $c =~ ^[0-9]{1,2}$ ]] && ((10#$c >= 1 && 10#$c <= ${#FIELDS[@]})); then
@@ -940,6 +977,8 @@ menu_edit() {
       rollback "$BAK" "配置无效，已回滚修改"
     fi
     pause
+  else
+    PENDING_BAK=""
   fi
 }
 
@@ -1002,15 +1041,31 @@ menu_service() {
 
 uninstall() {
   title "${R}彻底卸载${N}"
-  warn "将删除内核、配置、节点、证书、日志及快捷命令，不可恢复"
-  read -rp "输入 yes 确认卸载: " v
-  [[ $v == yes ]] || return
+  local n=0 svc_file="/etc/init.d/xray"
+  [[ -f $NODES ]] && n=$(jq length "$NODES" 2>/dev/null || echo 0)
+  [[ $OS == debian ]] && svc_file="/etc/systemd/system/xray.service"
+  warn "此操作将彻底清除 Xray 及其全部数据，不可恢复"
+  ((n > 0)) && warn "当前仍有 $n 个节点配置，卸载后将全部丢失"
+  echo
+  printf "${D}将删除以下内容：${N}\n"
+  printf "${D}-${N} 内核文件  %s\n" "$XR_BIN"
+  printf "${D}-${N} 快捷命令  /usr/local/bin/xr\n"
+  printf "${D}-${N} 配置目录  %s（含节点与证书）\n" "$XR_DIR"
+  printf "${D}-${N} 服务配置  %s\n" "$svc_file"
+  [[ $OS == alpine ]] && printf "${D}-${N} 运行日志  %s\n" "$XR_LOG"
+  echo
+  if ! confirm "确认彻底卸载？"; then
+    info "已取消卸载"
+    sleep 0.6
+    return
+  fi
+  echo
+  info "正在停止服务并清理文件…"
   svc_ctl stop
   svc_ctl disable
-  rm -f /etc/systemd/system/xray.service /etc/init.d/xray \
+  rm -f /etc/systemd/system/xray.service /etc/init.d/xray /etc/logrotate.d/xray \
     "$XR_BIN" /usr/local/bin/xr "$XR_LOG" /run/xray.pid
   rm -rf "$XR_DIR"
-  [[ -f $0 && $(readlink -f "$0") != /usr/local/bin/xr ]] && rm -f "$0"
   [[ $OS == debian ]] && systemctl daemon-reload
   ok "已彻底卸载并清理全部数据"
   exit 0
@@ -1084,7 +1139,9 @@ init_dirs
 if [[ -f $0 && $(readlink -f "$0") != /usr/local/bin/xr ]]; then
   install -m755 "$0" /usr/local/bin/xr 2>/dev/null
 elif [[ ! -f $0 && ! -x /usr/local/bin/xr && -n $SCRIPT_URL ]]; then
-  curl -fsSL "$SCRIPT_URL" -o /usr/local/bin/xr 2>/dev/null && chmod 755 /usr/local/bin/xr
+  if confirm "是否安装快捷命令 xr（来源：$SCRIPT_URL）？"; then
+    curl -fsSL "$SCRIPT_URL" -o /usr/local/bin/xr 2>/dev/null && chmod 755 /usr/local/bin/xr
+  fi
 fi
 main_menu
 

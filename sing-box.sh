@@ -38,6 +38,14 @@ title() {
   header
   printf '%s▸%s %s%s%s\n' "$C" "$N" "$B" "$1" "$N"
 }
+_pad_left() { # $1=text $2=display_width
+  local s=$1 target=$2 chars bytes w
+  chars=${#s}
+  bytes=$(printf '%s' "$s" | wc -c)
+  w=$((chars + (bytes - chars) / 2))
+  printf '%s' "$s"
+  ((w < target)) && printf '%*s' $((target - w)) ''
+}
 
 # ───────── 环境预检与锁 ─────────
 [[ $EUID -ne 0 ]] && {
@@ -665,12 +673,19 @@ ensure_core() {
 # ───────── 添加节点 ─────────
 add_socks() {
   ask_port socks || return 1
-  ask "用户名（0=取消）" "$(rnd 6)" || return 1
-  [[ $REPLY == 0 ]] && return 1
-  local u=$REPLY
+  local u p
+  while :; do
+    ask "用户名（0=取消）" "$(rnd 6)" || return 1
+    [[ $REPLY == 0 ]] && return 1
+    [[ -n $REPLY && ! $REPLY =~ [[:space:]] ]] && {
+      u=$REPLY
+      break
+    }
+    err "用户名不能为空或包含空白字符"
+  done
   ask "密码（0=取消）" "$(rnd 12)" || return 1
   [[ $REPLY == 0 ]] && return 1
-  local p=$REPLY
+  p=$REPLY
   jqw --argjson port "$PORT" --arg u "$u" --arg p "$p" \
     '. + [{type:"socks",tag:("socks-"+($port|tostring)),port:$port,user:$u,pass:$p}]'
 }
@@ -829,9 +844,9 @@ menu_add() {
   local c
   while :; do
     title "添加节点"
-    printf '%s1%s  VLESS          %s2%s  Hysteria2\n' "$C" "$N" "$C" "$N"
-    printf '%s3%s  AnyTLS         %s4%s  Snell\n' "$C" "$N" "$C" "$N"
-    printf '%s5%s  Shadowsocks    %s6%s  SOCKS\n' "$C" "$N" "$C" "$N"
+    printf '%s1%s  %s%s2%s  Hysteria2\n' "$C" "$N" "$(_pad_left "VLESS" 14)" "$C" "$N"
+    printf '%s3%s  %s%s4%s  Snell\n' "$C" "$N" "$(_pad_left "AnyTLS" 14)" "$C" "$N"
+    printf '%s5%s  %s%s6%s  SOCKS\n' "$C" "$N" "$(_pad_left "Shadowsocks" 14)" "$C" "$N"
     printf '%s0%s  返回\n' "$C" "$N"
     read -rp "> " c || return 0
     [[ -z $c ]] && continue
@@ -868,7 +883,8 @@ list_nodes() {
     info "暂无节点"
     return 1
   fi
-  printf '%s%-3s %-13s %-7s %s%s\n' "$D" "#" "协议" "端口" "摘要" "$N"
+  printf '%s%s%s%s%s\n' \
+    "$D" "$(_pad_left "#" 4)" "$(_pad_left "协议" 13)" "$(_pad_left "端口" 7)" "摘要$N"
   jq -r 'to_entries[] | .key+1 as $i | .value |
     "\($i) \(.type) \(.port) " +
     (if .type=="shadowsocks" then .method
@@ -876,7 +892,10 @@ list_nodes() {
      elif .type=="hysteria2" then .sni + (if (.obfs//"")!="" then "/\(if (.obfs_type//"")=="" then "salamander" else .obfs_type end)" else "" end)
      elif .sni then .sni
      else .user end)' "$NODES" \
-    | while read -r i t p m; do printf '%s%-3s%s %-13s %-7s %s%s%s\n' "$C" "$i" "$N" "$t" "$p" "$D" "$m" "$N"; done
+    | while read -r i t p m; do
+      printf '%s%s%s%s%s%s%s%s\n' \
+        "$C" "$(_pad_left "$i" 4)" "$N" "$(_pad_left "$t" 13)" "$(_pad_left "$p" 7)" "$D" "$m" "$N"
+    done
 }
 
 build_link() { # $1=raw_ip；单次 jq 完成编码与拼接
@@ -910,26 +929,26 @@ build_link() { # $1=raw_ip；单次 jq 完成编码与拼接
 
 show_link() {
   IDX=$1
-  local name t host meta
-  meta=$(jq -r --argjson i "$IDX" '(.[$i] // {}) | [(.tag // ""), (.type // ""), (.host // "")] | join("\u001f")' "$NODES")
-  IFS=$'\x1f' read -r name t host <<<"$meta"
-  printf '%s%s%s' "$B" "$name" "$N"
-  [[ $t == snell ]] && printf '  %s(Surge)%s' "$D" "$N"
-  echo
+  local name t port host meta badge
+  meta=$(jq -r --argjson i "$IDX" '(.[$i] // {}) | [(.tag // ""), (.type // ""), ((.port // "")|tostring), (.host // "")] | join("\u001f")' "$NODES")
+  IFS=$'\x1f' read -r name t port host <<<"$meta"
+  badge="$t · $port"
+  [[ $t == snell ]] && badge="$badge · Surge"
+  printf '%s▸%s %s%s%s  %s(%s)%s\n' "$C" "$N" "$B" "$name" "$N" "$D" "$badge" "$N"
   if [[ -n $host ]]; then
-    printf '%s%s%s\n' "$G" "$(build_link "$host")" "$N"
+    printf '%s%s%s\n\n' "$G" "$(build_link "$host")" "$N"
     return
   fi
   detect_ips
   if [[ -n $PUBIP4 && -n $PUBIP6 ]]; then
-    printf '%s[IPv4]%s %s%s%s\n' "$D" "$N" "$G" "$(build_link "$PUBIP4")" "$N"
-    printf '%s[IPv6]%s %s%s%s\n' "$D" "$N" "$G" "$(build_link "$PUBIP6")" "$N"
+    printf '%sIPv4:%s\n%s%s%s\n' "$D" "$N" "$G" "$(build_link "$PUBIP4")" "$N"
+    printf '%sIPv6:%s\n%s%s%s\n\n' "$D" "$N" "$G" "$(build_link "$PUBIP6")" "$N"
   elif [[ -n $PUBIP4 ]]; then
-    printf '%s%s%s\n' "$G" "$(build_link "$PUBIP4")" "$N"
+    printf '%s%s%s\n\n' "$G" "$(build_link "$PUBIP4")" "$N"
   elif [[ -n $PUBIP6 ]]; then
-    printf '%s%s%s\n' "$G" "$(build_link "$PUBIP6")" "$N"
+    printf '%s%s%s\n\n' "$G" "$(build_link "$PUBIP6")" "$N"
   else
-    printf '%s%s%s\n' "$G" "$(build_link "YOUR_IP")" "$N"
+    printf '%s%s%s\n\n' "$G" "$(build_link "YOUR_IP")" "$N"
   fi
 }
 
@@ -1220,10 +1239,12 @@ menu_edit() {
         v=$(g "$k")
         [[ -z $v ]] && v="—"
       fi
-      printf '%s%-2s%s %-14s %s%s%s\n' "$C" "$i" "$N" "${f#*:}" "$D" "$v" "$N"
+      printf '%s%s%s%s%s%s%s\n' \
+        "$C" "$(_pad_left "$i" 3)" "$N" "$(_pad_left "${f#*:}" 16)" "$D" "$v" "$N"
       ((i++))
     done
-    printf '%s0%s  保存并返回      %sq%s  放弃修改\n' "$C" "$N" "$C" "$N"
+    printf '%s%s%s%s%s%s\n' \
+      "$C" "$(_pad_left "0" 3)" "$N" "$(_pad_left "保存并返回" 16)" "${C}q${N}  " "放弃修改"
     read -rp "> " c || {
       cp "$BAK_NODES" "$NODES"
       chmod 600 "$NODES"
@@ -1333,11 +1354,24 @@ menu_service() {
 }
 
 uninstall() {
+  local svc_file="/etc/init.d/sing-box"
+  [[ $OS == debian ]] && svc_file="/etc/systemd/system/sing-box.service"
   title "${R}彻底卸载${N}"
-  warn "将删除内核、配置、节点、证书、日志及快捷命令 /usr/local/bin/sb，不可恢复"
-  local v
-  read -rp "输入 yes 确认卸载: " v || return 0
-  [[ $v == yes ]] || return 0
+  echo
+  warn "将停止服务并删除以下全部数据（不可恢复）："
+  printf '%s-%s %s%s\n' "$R" "$N" "$(_pad_left "内核程序" 10)" "$SB_BIN"
+  printf '%s-%s %s%s\n' "$R" "$N" "$(_pad_left "快捷命令" 10)" "/usr/local/bin/sb"
+  printf '%s-%s %s%s\n' "$R" "$N" "$(_pad_left "配置目录" 10)" "$SB_DIR（节点、证书、config.json）"
+  printf '%s-%s %s%s\n' "$R" "$N" "$(_pad_left "服务文件" 10)" "$svc_file"
+  printf '%s-%s %s%s\n' "$R" "$N" "$(_pad_left "运行日志" 10)" "$SB_LOG"
+  echo
+  if ! confirm "确认彻底卸载？"; then
+    info "已取消卸载"
+    sleep 0.6
+    return 0
+  fi
+  echo
+  info "正在停止服务并清理文件..."
   svc_ctl stop
   svc_ctl disable
   rm -f /etc/systemd/system/sing-box.service /etc/init.d/sing-box \
@@ -1371,11 +1405,11 @@ main_menu() {
   local c
   while :; do
     header
-    printf '%s1%s  节点列表       %s6%s  服务管理\n' "$C" "$N" "$C" "$N"
-    printf '%s2%s  添加节点       %s7%s  运行日志\n' "$C" "$N" "$C" "$N"
-    printf '%s3%s  编辑节点       %s8%s  更新内核\n' "$C" "$N" "$C" "$N"
-    printf '%s4%s  删除节点       %s9%s  彻底卸载\n' "$C" "$N" "$C" "$N"
-    printf '%s5%s  分享链接       %s0%s  退出\n' "$C" "$N" "$C" "$N"
+    printf '%s1%s  %s%s6%s  服务管理\n' "$C" "$N" "$(_pad_left "节点列表" 14)" "$C" "$N"
+    printf '%s2%s  %s%s7%s  运行日志\n' "$C" "$N" "$(_pad_left "添加节点" 14)" "$C" "$N"
+    printf '%s3%s  %s%s8%s  更新内核\n' "$C" "$N" "$(_pad_left "编辑节点" 14)" "$C" "$N"
+    printf '%s4%s  %s%s9%s  彻底卸载\n' "$C" "$N" "$(_pad_left "删除节点" 14)" "$C" "$N"
+    printf '%s5%s  %s%s0%s  退出\n' "$C" "$N" "$(_pad_left "分享链接" 14)" "$C" "$N"
     read -rp "> " c || exit 0
     case $c in
       1)
