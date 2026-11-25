@@ -79,6 +79,12 @@ prompt_choice() {
   read -rp "${C}›${N} " REPLY
 }
 
+show_toast() { # $1=函数名 $2=消息
+  [[ -n $2 ]] || return 0
+  echo
+  "$1" "$2"
+}
+
 proto_name() {
   case $1 in
     vless) echo "VLESS" ;;
@@ -113,6 +119,7 @@ RUN_TMP=$(mktemp -d -t sb-panel.XXXXXX) || { err "无法创建临时目录"; exi
 CONF_TMP="$RUN_TMP/config.json"
 PENDING_BAK=""
 CONF_DIRTY=0
+SB_VER=""
 
 node_count() { [[ -f $NODES ]] && jq length "$NODES" 2>/dev/null || echo 0; }
 sb_installed() { [[ -x $SB_BIN ]]; }
@@ -160,7 +167,9 @@ ensure_deps() {
 }
 
 svc_install() {
+  local first=0
   if [[ $OS == debian ]]; then
+    [[ -f /etc/systemd/system/sing-box.service ]] || first=1
     cat >/etc/systemd/system/sing-box.service <<EOF
 [Unit]
 Description=sing-box service
@@ -179,6 +188,7 @@ WantedBy=multi-user.target
 EOF
     systemctl daemon-reload
   else
+    [[ -f /etc/init.d/sing-box ]] || first=1
     cat >/etc/init.d/sing-box <<EOF
 #!/sbin/openrc-run
 name="sing-box"
@@ -206,6 +216,7 @@ $SB_LOG {
 EOF
     fi
   fi
+  ((first)) && svc_ctl enable
 }
 
 svc_ctl() { # is-active | is-enabled | enable | disable | restart | stop
@@ -271,7 +282,7 @@ init_dirs() {
 _download_sb() { # $1=ver $2=target $3=tmp_dir [$4=expected_sha256]
   local pkg="sing-box-$1-linux-$2"
   local url="https://github.com/SagerNet/sing-box/releases/download/v$1/$pkg.tar.gz"
-  local expected=${4:-} actual bin_path
+  local expected=${4:-} actual bin_path new_ver err_out
   info "正在下载 sing-box v$1（$2）…"
   curl -fsSL -o "$3/sb.tar.gz" "$url" 2>/dev/null || { err "安装包下载失败"; return 1; }
   if [[ -n $expected ]]; then
@@ -281,23 +292,29 @@ _download_sb() { # $1=ver $2=target $3=tmp_dir [$4=expected_sha256]
   else
     warn "未获取到上游 SHA256 摘要，跳过完整性校验"
   fi
-  info "正在安装二进制文件与系统服务…"
-  if ! tar -xzf "$3/sb.tar.gz" -C "$3" 2>/dev/null; then
-    err "解压安装包失败"
-    return 1
-  fi
+  info "正在验证并安装二进制文件…"
+  tar -xzf "$3/sb.tar.gz" -C "$3" 2>/dev/null || { err "解压安装包失败"; return 1; }
   bin_path=$(find "$3" -maxdepth 2 -type f -name sing-box | head -n 1)
-  if [[ -z $bin_path ]] \
-    || ! install -m755 "$bin_path" "$SB_BIN.new" 2>/dev/null \
-    || ! mv -f "$SB_BIN.new" "$SB_BIN" 2>/dev/null; then
+  if [[ -z $bin_path ]] || ! install -m755 "$bin_path" "$SB_BIN.new" 2>/dev/null; then
     rm -f "$SB_BIN.new"
     err "提取或写入可执行文件失败"
     return 1
   fi
+  # 原子替换前先冒烟验证，防止异常包破坏现有可用内核
+  err_out=$("$SB_BIN.new" version 2>&1) || true
+  new_ver=$(awk 'NR==1 && $1=="sing-box"{print $3}' <<<"$err_out")
+  if [[ -z $new_ver ]]; then
+    rm -f "$SB_BIN.new"
+    err "下载的二进制文件无法在当前系统执行"
+    [[ -n $err_out ]] && printf '%s\n' "$err_out" | head -n 3
+    return 1
+  fi
+  mv -f "$SB_BIN.new" "$SB_BIN" 2>/dev/null || { rm -f "$SB_BIN.new"; err "替换可执行文件失败"; return 1; }
+  SB_VER=$new_ver
 }
 
 install_sb() {
-  local arch target ver tmp eff_url rel_json sha="" v rc=0
+  local arch target ver tmp eff_url rel_json sha="" rc=0
   case $(uname -m) in
     x86_64 | amd64) arch=amd64 ;;
     aarch64 | arm64) arch=arm64 ;;
@@ -306,7 +323,9 @@ install_sb() {
     *) err "不支持的系统架构：$(uname -m)"; return 1 ;;
   esac
   target=$arch
-  [[ $OS == alpine ]] && target+="-musl"
+  if [[ $OS == alpine ]] || ldd --version 2>&1 | grep -qi musl; then
+    target+="-musl"
+  fi
   info "正在查询最新 sing-box 版本…"
   rel_json=$(curl -fsSL -m 10 https://api.github.com/repos/SagerNet/sing-box/releases/latest 2>/dev/null || true)
   if [[ -n $rel_json ]]; then
@@ -323,9 +342,12 @@ install_sb() {
     [[ $ver == latest ]] && ver=""
   fi
   [[ -n $ver ]] || { err "获取最新版本信息失败，请检查网络连接"; return 1; }
-  if sb_installed && [[ $(sb_version) == "$ver" ]]; then
-    ok "当前已是最新版本 v$ver"
-    confirm "是否强制重新安装？" || return 2
+  if sb_installed; then
+    [[ -n $SB_VER ]] || SB_VER=$(sb_version)
+    if [[ $SB_VER == "$ver" ]]; then
+      ok "当前已是最新版本 v$ver"
+      confirm "是否强制重新安装？" || return 2
+    fi
   fi
   tmp=$(mktemp -d "$RUN_TMP"/dl.XXXXXX) || { err "创建临时下载目录失败"; return 1; }
   _download_sb "$ver" "$target" "$tmp" "$sha" || rc=$?
@@ -333,111 +355,80 @@ install_sb() {
   ((rc == 0)) || return 1
   init_dirs
   svc_install
-  v=$(sb_version)
-  if [[ -z $v ]]; then
-    err "安装完成但无法执行 sing-box"
-    "$SB_BIN" version 2>&1 | head -n 3
-    return 1
-  fi
-  ok "sing-box v$v 安装完成"
+  ok "sing-box v$SB_VER 安装完成"
 }
 
-# ───────── 配置生成（严格遵循 sing-box 官方文档 1.13+ 标准）─────────
+# ───────── 配置生成（严格遵循 sing-box 官方文档 1.14+ 标准）─────────
 gen_config() {
   local listen_ip="::"
-  if [[ ! -s /proc/net/if_inet6 ]] \
-    || { [[ $(cat /proc/sys/net/ipv6/bindv6only 2>/dev/null) == 1 ]] && ip -4 route show default 2>/dev/null | grep -q .; }; then
-    listen_ip="0.0.0.0"
-  fi
-  jq --arg l "$listen_ip" '{
-    log: {level: "warn", timestamp: true},
-    inbounds: map(
-      if .type == "socks" then
-        {
-          type: "socks", tag: .tag, listen: $l, listen_port: .port,
-          users: [{username: .user, password: .pass}]
-        }
-      elif .type == "shadowsocks" then
-        {
-          type: "shadowsocks", tag: .tag, listen: $l, listen_port: .port,
-          method: .method, password: .password
-        }
-      elif .type == "trojan" then
-        {
-          type: "trojan", tag: .tag, listen: $l, listen_port: .port,
-          users: [{password: .password}],
-          tls: {
-            enabled: true, server_name: .sni,
-            alpn: ["h2", "http/1.1"],
-            certificate_path: .cert, key_path: .key
-          }
-        }
-      elif .type == "anytls" then
-        {
-          type: "anytls", tag: .tag, listen: $l, listen_port: .port,
-          users: [{password: .password}],
-          tls: {
-            enabled: true, server_name: .sni,
-            certificate_path: .cert, key_path: .key
-          }
-        }
-      elif .type == "vless" then
-        {
-          type: "vless", tag: .tag, listen: $l, listen_port: .port,
-          users: [{uuid: .uuid, flow: "xtls-rprx-vision"}],
-          tls: {
-            enabled: true, server_name: .sni,
-            reality: {
-              enabled: true,
-              handshake: {server: .sni, server_port: 443},
-              private_key: .priv,
-              short_id: [.sid]
+  [[ -s /proc/net/if_inet6 ]] || listen_ip="0.0.0.0"
+  jq --arg l "$listen_ip" '
+    def base: {type: .type, tag: .tag, listen: $l, listen_port: .port};
+    def tls($alpn):
+      {enabled: true, server_name: .sni, certificate_path: .cert, key_path: .key}
+      + (if $alpn != null then {alpn: $alpn} else {} end);
+    {
+      log: {level: "warn", timestamp: true},
+      dns: {
+        servers: [{type: "local", tag: "local"}],
+        final: "local",
+        optimistic: true
+      },
+      inbounds: map(
+        if .type == "socks" then
+          base + {users: [{username: .user, password: .pass}]}
+        elif .type == "shadowsocks" then
+          base + {method: .method, password: .password}
+        elif .type == "trojan" then
+          base + {users: [{name: .tag, password: .password}], tls: tls(["h2", "http/1.1"])}
+        elif .type == "anytls" then
+          base + {users: [{name: .tag, password: .password}], tls: tls(null)}
+        elif .type == "vless" then
+          base + {
+            users: [{name: .tag, uuid: .uuid, flow: "xtls-rprx-vision"}],
+            tls: {
+              enabled: true, server_name: .sni,
+              reality: {
+                enabled: true,
+                handshake: {server: .sni, server_port: 443},
+                private_key: .priv,
+                short_id: [.sid]
+              }
             }
           }
-        }
-      elif .type == "vmess" then
-        {
-          type: "vmess", tag: .tag, listen: $l, listen_port: .port,
-          users: [{uuid: .uuid, alterId: 0}],
-          tls: {
-            enabled: true, server_name: .sni,
-            alpn: ["http/1.1"],
-            certificate_path: .cert, key_path: .key
-          },
-          transport: {type: "ws", path: .path}
-        }
-      elif .type == "hysteria2" then
-        {
-          type: "hysteria2", tag: .tag, listen: $l, listen_port: .port,
-          users: [{password: .password}],
-          tls: {
-            enabled: true, server_name: .sni,
-            alpn: ["h3"],
-            certificate_path: .cert, key_path: .key
+        elif .type == "vmess" then
+          base + {
+            users: [{name: .tag, uuid: .uuid, alterId: 0}],
+            tls: tls(["http/1.1"]),
+            transport: {type: "ws", path: .path}
           }
-        }
-      elif .type == "tuic" then
-        {
-          type: "tuic", tag: .tag, listen: $l, listen_port: .port,
-          users: [{uuid: .uuid, password: .password}],
-          congestion_control: (.cc // "bbr"),
-          tls: {
-            enabled: true, server_name: .sni,
-            alpn: ["h3"],
-            certificate_path: .cert, key_path: .key
+        elif .type == "hysteria2" then
+          base + {
+            users: [{name: .tag, password: .password}],
+            bbr_profile: (.bbr_profile // "standard"),
+            tls: tls(["h3"])
           }
-        }
-      else empty end
-    ),
-    outbounds: [{type: "direct", tag: "direct"}],
-    route: {
-      rules: [
-        {action: "sniff"},
-        {ip_is_private: true, action: "reject"}
-      ],
-      final: "direct"
+        elif .type == "tuic" then
+          base + {
+            users: [{name: .tag, uuid: .uuid, password: .password}],
+            congestion_control: (.cc // "bbr"),
+            zero_rtt_handshake: false,
+            tls: tls(["h3"])
+          }
+        else empty end
+      ),
+      outbounds: [{type: "direct", tag: "direct"}],
+      route: {
+        rules: [
+          {action: "sniff"},
+          {action: "resolve"},
+          {ip_is_private: true, action: "reject"}
+        ],
+        final: "direct",
+        default_domain_resolver: "local"
+      }
     }
-  }' "$NODES" >"$CONF_TMP"
+  ' "$NODES" >"$CONF_TMP"
 }
 
 apply() {
@@ -463,7 +454,6 @@ apply() {
     ok "当前无可用节点，已自动停止服务"
     return 0
   fi
-  svc_ctl enable
   svc_ctl restart
   for i in 1 2 3 4 5 6; do
     sleep 0.5
@@ -474,6 +464,7 @@ apply() {
       return 0
     }
   done
+  [[ -n $PENDING_BAK ]] || CONF_DIRTY=0
   err "服务未能正常启动，请前往「运行日志」排查原因"
   return 1
 }
@@ -481,7 +472,10 @@ apply() {
 # ───────── 通用校验与辅助 ─────────
 rnd() { tr -dc 'A-Za-z0-9' </dev/urandom | head -c "${1:-16}"; }
 valid_port() { [[ $1 =~ ^[0-9]{1,5}$ ]] && ((10#$1 >= 1 && 10#$1 <= 65535)); }
-valid_sni() { [[ $1 =~ ^[A-Za-z0-9.-]+$ && $1 != .* && $1 != *. && $1 != *..* ]]; }
+valid_sni() {
+  [[ $1 =~ ^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?$ ]] \
+    && [[ $1 != *..* && $1 != *.-* && $1 != *-.* ]]
+}
 valid_path() { [[ $1 == /* && ! $1 =~ [[:space:]] ]]; }
 valid_ss2022_psk() {
   local need=16 decoded
@@ -491,42 +485,51 @@ valid_ss2022_psk() {
   ((decoded == need))
 }
 
-port_free() { # $1=port $2=tcp|udp|both(默认 both)
-  local p=$1 l4=${2:-both} ss_opt="-lntu"
+port_free() { # $1=port $2=tcp|udp|both [$3=豁免的本节点原端口]
+  local p=$1 l4=${2:-both} own=${3:-} ss_opt="-lntu"
   case $l4 in
     tcp) ss_opt="-lnt" ;;
     udp) ss_opt="-lnu" ;;
   esac
-  ! ss "$ss_opt" 2>/dev/null | awk 'NR>1{print $5}' | grep -qE "[:.]$p$" \
-    && ! jq -e --argjson p "$p" --arg l4 "$l4" '
-      def l4of: if .type == "hysteria2" or .type == "tuic" then "udp"
-                elif .type == "shadowsocks" or .type == "socks" then "both"
-                else "tcp" end;
-      any(.[]; .port == $p and ($l4 == "both" or l4of == "both" or l4of == $l4))
-    ' "$NODES" >/dev/null 2>&1
+  if [[ -z $own || $p != "$own" ]]; then
+    ss "$ss_opt" 2>/dev/null | awk 'NR>1{print $5}' | grep -qE "[:.]$p$" && return 1
+  fi
+  ! jq -e --argjson p "$p" --arg l4 "$l4" '
+    def l4of: if .type == "hysteria2" or .type == "tuic" then "udp"
+              elif .type == "shadowsocks" or .type == "socks" then "both"
+              else "tcp" end;
+    any(.[]; .port == $p and ($l4 == "both" or l4of == "both" or l4of == $l4))
+  ' "$NODES" >/dev/null 2>&1
 }
 
-ask_port() { # $1=协议类型；取消返回 2
-  local l4 l4_txt def
+ask_port() { # $1=协议类型 [$2=当前值(编辑模式) [$3=豁免原端口]]；取消或未变更返回 2
+  local l4 l4_txt def prompt cur=${2:-} own=${3:-}
   l4=$(proto_l4 "$1")
   l4_txt=$(l4_label "$l4")
+  if [[ -n $cur ]]; then
+    def=$cur
+    prompt="新端口（$l4_txt，0 取消）"
+  else
+    while :; do
+      def=$((20000 + RANDOM % 30000))
+      port_free "$def" "$l4" && break
+    done
+    prompt="监听端口（$l4_txt）"
+  fi
   while :; do
-    def=$((20000 + RANDOM % 30000))
-    port_free "$def" "$l4" && break
-  done
-  while :; do
-    ask_c "监听端口（$l4_txt）" "$def" || return 2
+    ask_c "$prompt" "$def" || return 2
+    [[ -n $cur && $REPLY == "$cur" ]] && return 2
     valid_port "$REPLY" || { err "端口无效，请输入 1-65535 之间的整数"; continue; }
     PORT=$((10#$REPLY))
-    port_free "$PORT" "$l4" && return 0
+    port_free "$PORT" "$l4" "$own" && return 0
     err "端口 $PORT（$l4_txt）已被占用，请更换其他端口"
   done
 }
 
-ask_sni() { # $1=提示 $2=变量名（默认 SNI）；取消返回 2
-  local var=${2:-SNI}
+ask_sni() { # $1=提示 $2=变量名(默认 SNI) [$3=默认值]；取消返回 2
+  local var=${2:-SNI} def=${3:-$DEFAULT_SNI}
   while :; do
-    ask_c "$1" "$DEFAULT_SNI" || return 2
+    ask_c "$1" "$def" || return 2
     valid_sni "$REPLY" && { printf -v "$var" '%s' "$REPLY"; return 0; }
     err "域名 / SNI 格式无效（仅支持字母、数字、点与连字符）"
   done
@@ -631,9 +634,7 @@ gen_reality() {
 gen_uuid() { "$SB_BIN" generate uuid 2>/dev/null || cat /proc/sys/kernel/random/uuid; }
 
 pick_tuic_cc() { # $1=默认值 $2=提示 -> TUIC_CC；取消返回 2
-  printf "  ${C}1${N}  bbr        ${D}推荐${N}\n"
-  printf "  ${C}2${N}  cubic\n"
-  printf "  ${C}3${N}  new_reno\n"
+  printf "  ${C}1${N}  bbr        ${D}推荐${N}\n  ${C}2${N}  cubic\n  ${C}3${N}  new_reno\n"
   while :; do
     ask_c "$2" "$1" || return 2
     case $REPLY in
@@ -641,6 +642,19 @@ pick_tuic_cc() { # $1=默认值 $2=提示 -> TUIC_CC；取消返回 2
       2 | cubic) TUIC_CC=cubic; return 0 ;;
       3 | new_reno) TUIC_CC=new_reno; return 0 ;;
       *) err "仅支持 1 (bbr)、2 (cubic) 或 3 (new_reno)" ;;
+    esac
+  done
+}
+
+pick_hy2_bbr() { # $1=默认值 $2=提示 -> HY2_BBR；取消返回 2
+  printf "  ${C}1${N}  standard      ${D}默认${N}\n  ${C}2${N}  conservative  ${D}保守${N}\n  ${C}3${N}  aggressive    ${D}激进${N}\n"
+  while :; do
+    ask_c "$2" "$1" || return 2
+    case $REPLY in
+      1 | standard) HY2_BBR=standard; return 0 ;;
+      2 | conservative) HY2_BBR=conservative; return 0 ;;
+      3 | aggressive) HY2_BBR=aggressive; return 0 ;;
+      *) err "仅支持 1 (standard)、2 (conservative) 或 3 (aggressive)" ;;
     esac
   done
 }
@@ -691,7 +705,8 @@ _add_tls_pw() { # $1=type $2=tag前缀
   local p=$REPLY
   jqw --arg t "$1" --arg pfx "$2" --argjson port "$PORT" --arg p "$p" \
     --arg c "$CERT" --arg k "$KEY" --arg sni "$SNI" --arg h "$HOST" --argjson i "$INSECURE" \
-    '. + [{type:$t,tag:($pfx+"-"+($port|tostring)),port:$port,password:$p,cert:$c,key:$k,sni:$sni,host:$h,insecure:$i}]'
+    '. + [{type:$t,tag:($pfx+"-"+($port|tostring)),port:$port,password:$p,cert:$c,key:$k,sni:$sni,host:$h,insecure:$i}
+     + (if $t=="hysteria2" then {bbr_profile:"standard"} else {} end)]'
 }
 
 add_tuic() {
@@ -736,14 +751,10 @@ menu_add() {
     printf "  ${C}5${N}  %-13s ${D}%s${N}\n" "Trojan" "TCP + TLS"
     printf "  ${C}6${N}  %-13s ${D}%s${N}\n" "VMess" "WebSocket + TLS"
     printf "  ${C}7${N}  %-13s ${D}%s${N}\n" "Shadowsocks" "SS 2022 / AEAD"
-    printf "  ${C}8${N}  %-13s ${D}%s${N}\n" "SOCKS5" "账号密码认证"
-    echo
+    printf "  ${C}8${N}  %-13s ${D}%s${N}\n\n" "SOCKS5" "账号密码认证"
     printf "  ${D}0  返回主菜单${N}\n"
-    if [[ -n $msg ]]; then
-      echo
-      err "$msg"
-      msg=""
-    fi
+    show_toast err "$msg"
+    msg=""
     prompt_choice || return
     c=$REPLY
     [[ -z $c ]] && continue
@@ -839,7 +850,7 @@ build_link() { # $1=raw_ip；单次 jq 完成编码与拼接
       elif $n.type == "hysteria2" then
         "hysteria2://\($n.password | e)@\($h):\($n.port)/?sni=\($n.sni | e)&insecure=\($n.insecure // 0)#\($n.tag | e)"
       elif $n.type == "tuic" then
-        "tuic://\($n.uuid | e):\($n.password | e)@\($h):\($n.port)/?sni=\($n.sni | e)&alpn=h3&congestion_control=\(($n.cc // "bbr") | e)&allow_insecure=\($n.insecure // 0)#\($n.tag | e)"
+        "tuic://\($n.uuid | e):\($n.password | e)@\($h):\($n.port)/?sni=\($n.sni | e)&alpn=h3&udp_relay_mode=native&congestion_control=\(($n.cc // "bbr") | e)&allow_insecure=\($n.insecure // 0)#\($n.tag | e)"
       elif $n.type == "vmess" then
         "vmess://" + ({
           v: "2", ps: ($n.tag // ""), add: $ip, port: ($n.port | tostring),
@@ -910,11 +921,26 @@ node_fields() {
   case $(g type) in
     socks) FIELDS=("port:监听端口" "user:用户名" "pass:密码") ;;
     shadowsocks) FIELDS=("port:监听端口" "method:加密方式" "password:密码") ;;
-    trojan | hysteria2 | anytls) FIELDS=("port:监听端口" "password:连接密码" "sni:域名 / SNI" "_cert:更换证书") ;;
+    trojan | anytls) FIELDS=("port:监听端口" "password:连接密码" "sni:域名 / SNI" "_cert:更换证书") ;;
+    hysteria2) FIELDS=("port:监听端口" "password:连接密码" "bbr_profile:BBR 配置" "sni:域名 / SNI" "_cert:更换证书") ;;
     tuic) FIELDS=("port:监听端口" "uuid:UUID" "password:连接密码" "cc:拥塞控制" "sni:域名 / SNI" "_cert:更换证书") ;;
     vless) FIELDS=("port:监听端口" "sni:伪装域名" "uuid:UUID" "sid:ShortID" "_reality:重置 Reality 密钥") ;;
     vmess) FIELDS=("port:监听端口" "uuid:UUID" "path:WebSocket 路径" "sni:域名 / SNI" "_cert:更换证书") ;;
   esac
+}
+
+field_val() { # $1=field_key -> 展示值
+  [[ $1 == _* ]] && return 0
+  local v
+  v=$(g "$1")
+  if [[ -z $v ]]; then
+    case $1 in
+      bbr_profile) v=standard ;;
+      cc) v=bbr ;;
+      *) v="—" ;;
+    esac
+  fi
+  printf '%s' "$v"
 }
 
 _ask_match() { # $1=提示 $2=默认 $3=正则 $4=错误提示
@@ -927,23 +953,15 @@ _ask_match() { # $1=提示 $2=默认 $3=正则 $4=错误提示
 }
 
 edit_field() {
-  local k=$1 cur np l4 ptype
+  local k=$1 cur ptype
   EDIT_NOTICE=""
   cur=$(g "$k")
   ptype=$(g type)
   case $k in
     port)
-      l4=$(proto_l4 "$ptype")
-      while :; do
-        ask_c "新端口（0 取消）" "$cur" || return 1
-        [[ $REPLY == "$cur" ]] && return 1
-        valid_port "$REPLY" || { err "端口无效，请输入 1-65535 之间的整数"; continue; }
-        np=$((10#$REPLY))
-        port_free "$np" "$l4" && break
-        err "端口 $np 已被占用"
-      done
-      jqw --argjson i "$IDX" --arg t "$(g tag | sed "s/-$cur\$/-$np/")" --argjson p "$np" '.[$i].tag=$t | .[$i].port=$p'
-      EDIT_NOTICE="端口已更新为 $np"
+      ask_port "$ptype" "$cur" "$ORIG_PORT" || return 1
+      jqw --argjson i "$IDX" --arg t "$(g tag | sed "s/-$cur\$/-$PORT/")" --argjson p "$PORT" '.[$i].tag=$t | .[$i].port=$p'
+      EDIT_NOTICE="端口已更新为 $PORT"
       ;;
     method)
       pick_ss_method 1 || return 1
@@ -971,14 +989,16 @@ edit_field() {
       setf "$IDX" cc "$TUIC_CC"
       EDIT_NOTICE="拥塞控制算法已切换为 $TUIC_CC"
       ;;
+    bbr_profile)
+      pick_hy2_bbr "${cur:-standard}" "BBR 配置（0 取消）" || return 1
+      [[ $HY2_BBR == "${cur:-standard}" ]] && return 1
+      setf "$IDX" bbr_profile "$HY2_BBR"
+      EDIT_NOTICE="BBR 配置已切换为 $HY2_BBR"
+      ;;
     sni)
-      while :; do
-        ask_c "新域名 / SNI（0 取消）" "$cur" || return 1
-        [[ $REPLY == "$cur" ]] && return 1
-        valid_sni "$REPLY" && break
-        err "域名 / SNI 格式无效（仅支持字母、数字、点与连字符）"
-      done
-      local new_sni=$REPLY insec
+      local new_sni insec
+      ask_sni "新域名 / SNI（0 取消）" new_sni "$cur" || return 1
+      [[ $new_sni == "$cur" ]] && return 1
       insec=$(g insecure)
       if [[ $insec == 1 ]]; then
         gen_self_cert "$new_sni" || { pause; return 1; }
@@ -993,14 +1013,11 @@ edit_field() {
       fi
       ;;
     path)
-      while :; do
-        ask_c "新路径（0 取消）" "$cur" || return 1
-        [[ $REPLY == "$cur" ]] && return 1
-        valid_path "$REPLY" && break
-        err "路径须以 / 开头且不能包含空白字符"
-      done
-      setf "$IDX" path "$REPLY"
-      EDIT_NOTICE="路径已更新为 $REPLY"
+      local new_path
+      ask_path "新路径（0 取消）" "$cur" new_path || return 1
+      [[ $new_path == "$cur" ]] && return 1
+      setf "$IDX" path "$new_path"
+      EDIT_NOTICE="路径已更新为 $new_path"
       ;;
     uuid)
       _ask_match "新 UUID" "$cur" '^[0-9a-fA-F]{8}(-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}$' "UUID 格式无效" || return 1
@@ -1041,7 +1058,8 @@ menu_edit() {
   title "编辑节点"
   list_nodes || { pause; return; }
   choose_node || return
-  local dirty=0 i f k v c notice="" err_msg="" tag_title
+  local dirty=0 i f c toast_fn="" toast_msg="" tag_title
+  ORIG_PORT=$(g port)
   snapshot
   while :; do
     tag_title="编辑节点 · $(g tag)"
@@ -1050,12 +1068,9 @@ menu_edit() {
     node_fields
     i=1
     for f in "${FIELDS[@]}"; do
-      k=${f%%:*}
-      v=""
-      [[ $k == _* ]] || { v=$(g "$k"); [[ -n $v ]] || v="—"; }
       printf "  ${C}%-2s${N} " "$i"
       pad_print "${f#*:}" 20
-      printf "${D}%s${N}\n" "$v"
+      printf "${D}%s${N}\n" "$(field_val "${f%%:*}")"
       ((i++))
     done
     echo
@@ -1064,15 +1079,9 @@ menu_edit() {
     else
       printf "  ${D}0  返回主菜单${N}\n"
     fi
-    if [[ -n $notice ]]; then
-      echo
-      note "$notice"
-      notice=""
-    elif [[ -n $err_msg ]]; then
-      echo
-      err "$err_msg"
-      err_msg=""
-    fi
+    show_toast "$toast_fn" "$toast_msg"
+    toast_fn=""
+    toast_msg=""
     prompt_choice || {
       ((dirty)) && rollback "$BAK" "已取消修改" || PENDING_BAK=""
       return
@@ -1093,10 +1102,12 @@ menu_edit() {
       echo
       if edit_field "${FIELDS[$((10#$c - 1))]%%:*}"; then
         dirty=1
-        notice=$EDIT_NOTICE
+        toast_fn=note
+        toast_msg=$EDIT_NOTICE
       fi
     else
-      err_msg="无效选项，请输入 1-${#FIELDS[@]}"
+      toast_fn=err
+      toast_msg="无效选项，请输入 1-${#FIELDS[@]}"
     fi
   done
   echo
@@ -1139,12 +1150,9 @@ menu_service() {
     printf "  ${C}2${N}  停止服务\n"
     printf "  ${C}3${N}  开机自启  ${D}[${N}%s${D}]${N}\n\n" "$auto"
     printf "  ${D}0  返回主菜单${N}\n"
-    if [[ -n $toast_msg ]]; then
-      echo
-      "$toast_fn" "$toast_msg"
-      toast_fn=""
-      toast_msg=""
-    fi
+    show_toast "$toast_fn" "$toast_msg"
+    toast_fn=""
+    toast_msg=""
     prompt_choice || return
     c=$REPLY
     [[ -z $c ]] && continue
@@ -1153,8 +1161,13 @@ menu_service() {
       1)
         echo
         if apply; then
-          toast_fn=ok
-          toast_msg="服务已重新加载并运行正常"
+          if (($(node_count) == 0)); then
+            toast_fn=info
+            toast_msg="当前无节点，服务已保持停止"
+          else
+            toast_fn=ok
+            toast_msg="服务已重新加载并运行正常"
+          fi
         else
           pause
         fi
@@ -1215,10 +1228,10 @@ uninstall() {
 header() {
   clear
   if sb_installed; then
-    local st="${D}○ 已停止${N}" v
+    local st="${D}○ 已停止${N}"
     svc_ctl is-active && st="${G}● 运行中${N}"
-    v=$(sb_version)
-    printf "${B}sing-box${N}   %s   ${D}v%s · %s 个节点${N}\n" "$st" "${v:-?}" "$(node_count)"
+    [[ -n $SB_VER ]] || SB_VER=$(sb_version)
+    printf "${B}sing-box${N}   %s   ${D}v%s · %s 个节点${N}\n" "$st" "${SB_VER:-?}" "$(node_count)"
   else
     printf "${B}sing-box${N}   ${D}未安装${N}\n"
   fi
@@ -1237,11 +1250,8 @@ main_menu() {
     printf "  ${C}3${N}  "; pad_print "编辑节点" 19; printf "${C}8${N}  更新内核\n"
     printf "  ${C}4${N}  "; pad_print "删除节点" 19; printf "${R}9${N}  彻底卸载\n"
     printf "  ${C}5${N}  "; pad_print "分享链接" 19; printf "${D}0  退出面板${N}\n"
-    if [[ -n $msg ]]; then
-      echo
-      err "$msg"
-      msg=""
-    fi
+    show_toast err "$msg"
+    msg=""
     prompt_choice || exit 0
     c=$REPLY
     case $c in
