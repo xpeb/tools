@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# sing-box 极简交互式面板（仅支持 Debian / Alpine）
+# Sing-box 极简交互式面板（仅支持 Debian / Alpine）
 # 协议：SOCKS / Shadowsocks / Hysteria2 / VLESS(Reality) / AnyTLS / Snell(v5/v6)
 
 export PATH="$PATH:/usr/local/sbin:/usr/sbin:/sbin"
@@ -342,7 +342,7 @@ install_singbox() {
   pkg_name="sing-box-$ver-linux-$arch$libc.tar.gz"
   url="https://github.com/SagerNet/sing-box/releases/download/v$ver/$pkg_name"
   tmp=$(mktemp -d "$RUN_TMP"/dl.XXXXXX)
-  info "正在下载 sing-box v$ver ..."
+  info "正在下载 Sing-box v$ver ..."
   if ! curl -fsSL --connect-timeout 15 -m 120 -o "$tmp/sb.tgz" "$url" 2>/dev/null; then
     err "下载安装包失败"
     rm -rf "$tmp"
@@ -372,7 +372,7 @@ install_singbox() {
     err "安装后无法执行，请检查系统库兼容性"
     return 1
   fi
-  ok "sing-box $v 已安装"
+  ok "Sing-box $v 已安装"
 }
 
 # ───────── 配置生成与生效 ─────────
@@ -445,7 +445,7 @@ apply() { # return 0=成功; 1=校验/生成失败($CONF未改); 2=写入或服�
   if ! out=$("$SB_BIN" check -c "$conf_tmp" 2>&1); then
     err "配置校验失败"
     printf '%s\n' "$out"
-    core_ok || warn "Snell / gecko 需要 sing-box >= $MIN_VER，请先更新内核"
+    core_ok || warn "Snell / gecko 需要 Sing-box >= $MIN_VER，请先更新内核"
     rm -f "$conf_tmp"
     return 1
   fi
@@ -681,7 +681,7 @@ choose_node() { # 交互选择节点并设置 IDX；取消返回 1
 
 ensure_core() {
   core_ok && return 0
-  warn "$1 需要 sing-box >= $MIN_VER（当前 $(sb_version)）"
+  warn "$1 需要 Sing-box >= $MIN_VER（当前 $(sb_version)）"
   confirm "立即更新内核？" && install_singbox && core_ok
 }
 
@@ -738,7 +738,7 @@ add_ss() {
 }
 
 pick_hy2_obfs() { # 设置 OBFS_T
-  printf '%s0%s  不启用\n%s1%s  salamander\n%s2%s  gecko  %s(需 sing-box>=1.14)%s\n' "$C" "$N" "$C" "$N" "$C" "$N" "$D" "$N"
+  printf '%s0%s  不启用\n%s1%s  salamander\n%s2%s  gecko  %s(需 Sing-box>=1.14)%s\n' "$C" "$N" "$C" "$N" "$C" "$N" "$D" "$N"
   ask "QUIC 混淆" "0" || return 1
   OBFS_T=""
   case $REPLY in
@@ -1410,9 +1410,9 @@ header() {
       st="${D}○ 已停止${N}"
     fi
     v=$(sb_version)
-    printf '%ssing-box%s  %s  %sv%s · %s 节点%s\n' "$B" "$N" "$st" "$D" "${v:-?}" "$n" "$N"
+    printf '%sSing-box%s  %s  %sv%s · %s 节点%s\n' "$B" "$N" "$st" "$D" "${v:-?}" "$n" "$N"
   else
-    printf '%ssing-box%s\n' "$B" "$N"
+    printf '%sSing-box%s\n' "$B" "$N"
   fi
 }
 
@@ -1464,7 +1464,7 @@ acquire_lock
 ensure_deps
 if ! sb_installed; then
   header
-  info "未检测到 sing-box"
+  info "未检测到 Sing-box"
   confirm "是否安装？" || exit 0
   install_singbox || exit 1
   sleep 0.8

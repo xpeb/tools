@@ -260,7 +260,7 @@ install_xray() {
     err "安装后无法执行"
     return 1
   fi
-  ok "xray $v 已安装"
+  ok "Xray-core $v 已安装"
 }
 
 # ───────── 配置生成（严格遵循 Xray-core 官方文档标准）─────────
@@ -304,7 +304,7 @@ gen_config() {
                 target: (.sni + ":443"), serverNames: [.sni],
                 privateKey: .priv, shortIds: [.sid]
               }
-            } + (if (.transport // "raw") == "xhttp" then {xhttpSettings: {path: (.path // "/")}} else {} end)
+            } + (if (.transport // "raw") == "xhttp" then {xhttpSettings: ({path: (.path // "/")} + (if (.xhost // "") != "" then {host: .xhost} else {} end))} else {} end)
           )
         }
       elif .type == "vmess" then
@@ -587,7 +587,7 @@ _add_tls_pw() { # $1=type $2=tag前缀
 
 add_vless() {
   ask_port
-  local tr=raw sni path=""
+  local tr=raw sni path="" xhost=""
   printf "${C}1${N}  RAW + Reality (Vision)  ${D}(推荐)${N}\n"
   printf "${C}2${N}  XHTTP + Reality\n"
   while :; do
@@ -605,12 +605,23 @@ add_vless() {
     esac
   done
   ask_sni "Reality 伪装域名" sni
-  [[ $tr == xhttp ]] && ask_path "XHTTP 路径" "/$(rnd 8)" path
+  if [[ $tr == xhttp ]]; then
+    ask_path "XHTTP 路径" "/$(rnd 8)" path
+    while :; do
+      ask "XHTTP Host（留空=不限制）" ""
+      [[ -z $REPLY ]] && break
+      valid_sni "$REPLY" && {
+        xhost=$REPLY
+        break
+      }
+      err "Host 格式无效"
+    done
+  fi
   gen_reality
-  jqw --argjson port "$PORT" --arg tr "$tr" --arg sni "$sni" --arg path "$path" \
+  jqw --argjson port "$PORT" --arg tr "$tr" --arg sni "$sni" --arg path "$path" --arg xhost "$xhost" \
     --arg priv "$RPRIV" --arg pub "$RPUB" --arg sid "$RSID" --arg uuid "$(gen_uuid)" \
     '. + [{type:"vless",tag:("vless-"+($port|tostring)),port:$port,transport:$tr,uuid:$uuid,sni:$sni,priv:$priv,pub:$pub,sid:$sid}
-     + (if $tr=="xhttp" then {path:$path} else {} end)]'
+     + (if $tr=="xhttp" then ({path:$path} + (if $xhost != "" then {xhost:$xhost} else {} end)) else {} end)]'
 }
 
 add_vmess() {
@@ -704,7 +715,9 @@ build_link() { # $1=raw_ip；单次 jq 完成编码与拼接
         "trojan://\($n.password | e)@\($h):\($n.port)?security=tls&sni=\($n.sni | e)&allowInsecure=\($n.insecure // 0)#\($n.tag | e)"
       elif $n.type == "vless" then
         if ($n.transport // "raw") == "xhttp" then
-          "vless://\($n.uuid | e)@\($h):\($n.port)?encryption=none&security=reality&sni=\($n.sni | e)&fp=chrome&pbk=\($n.pub | e)&sid=\($n.sid | e)&type=xhttp&path=\(($n.path // "/") | e)&mode=auto#\($n.tag | e)"
+          "vless://\($n.uuid | e)@\($h):\($n.port)?encryption=none&security=reality&sni=\($n.sni | e)&fp=chrome&pbk=\($n.pub | e)&sid=\($n.sid | e)&type=xhttp"
+          + (if ($n.xhost // "") != "" then "&host=\($n.xhost | e)" else "" end)
+          + "&path=\(($n.path // "/") | e)&mode=auto#\($n.tag | e)"
         else
           "vless://\($n.uuid | e)@\($h):\($n.port)?encryption=none&flow=xtls-rprx-vision&security=reality&sni=\($n.sni | e)&fp=chrome&pbk=\($n.pub | e)&sid=\($n.sid | e)&type=tcp#\($n.tag | e)"
         end
@@ -781,7 +794,7 @@ node_fields() {
     trojan | hysteria2) FIELDS=("port:端口" "password:密码" "sni:SNI" "_cert:更换证书") ;;
     vless)
       FIELDS=("port:端口" "transport:传输方式" "sni:伪装域名")
-      [[ $(g transport) == xhttp ]] && FIELDS+=("path:XHTTP 路径")
+      [[ $(g transport) == xhttp ]] && FIELDS+=("path:XHTTP 路径" "xhost:XHTTP Host")
       FIELDS+=("uuid:UUID" "sid:ShortID" "_reality:重置 Reality")
       ;;
     vmess) FIELDS=("port:端口" "uuid:UUID" "path:WS 路径" "sni:SNI" "_cert:更换证书") ;;
@@ -866,7 +879,7 @@ edit_field() {
         [[ -n $np_path ]] || np_path="/$(rnd 8)"
         jqw --argjson i "$IDX" --arg p "$np_path" '.[$i].transport="xhttp" | .[$i].path=$p'
       else
-        jqw --argjson i "$IDX" '.[$i].transport="raw" | del(.[$i].path)'
+        jqw --argjson i "$IDX" '.[$i].transport="raw" | del(.[$i].path, .[$i].xhost)'
       fi
       ;;
     sni)
@@ -891,6 +904,19 @@ edit_field() {
     path)
       _ask_match "新路径" "$cur" "$cur" '^/[^[:space:]]*$' "路径须以 / 开头且不含空格" || return 1
       setf "$IDX" path "$REPLY"
+      ;;
+    xhost)
+      while :; do
+        ask "新 XHTTP Host（-=清空，0=取消）" "$cur"
+        [[ $REPLY == 0 || $REPLY == "$cur" ]] && return 1
+        if [[ $REPLY == - ]]; then
+          jqw --argjson i "$IDX" 'del(.[$i].xhost)'
+          return 0
+        fi
+        valid_sni "$REPLY" && break
+        err "Host 格式无效"
+      done
+      setf "$IDX" xhost "$REPLY"
       ;;
     uuid)
       _ask_match "新 UUID" "$cur" "$cur" \
@@ -1046,7 +1072,7 @@ uninstall() {
   local n=0 svc_file="/etc/init.d/xray"
   [[ -f $NODES ]] && n=$(jq length "$NODES" 2>/dev/null || echo 0)
   [[ $OS == debian ]] && svc_file="/etc/systemd/system/xray.service"
-  warn "此操作将彻底清除 Xray 及其全部数据，不可恢复"
+  warn "此操作将彻底清除 Xray-core 及其全部数据，不可恢复"
   ((n > 0)) && warn "当前仍有 $n 个节点配置，卸载后将全部丢失"
   echo
   printf "${D}将删除以下内容：${N}\n"
@@ -1083,9 +1109,9 @@ header() {
       st="${G}● 运行中${N}"
     else st="${D}○ 已停止${N}"; fi
     v=$(xr_version)
-    printf "${B}xray${N}  %s  ${D}v%s · %s 节点${N}\n" "$st" "${v:-?}" "$n"
+    printf "${B}Xray-core${N}  %s  ${D}v%s · %s 节点${N}\n" "$st" "${v:-?}" "$n"
   else
-    printf "${B}xray${N}\n"
+    printf "${B}Xray-core${N}\n"
   fi
 }
 
@@ -1132,7 +1158,7 @@ main_menu() {
 ensure_deps
 if ! xr_installed; then
   header
-  info "未检测到 xray"
+  info "未检测到 Xray-core"
   confirm "是否安装？" || exit 0
   install_xray || exit 1
   sleep 0.8
