@@ -402,17 +402,17 @@ setf() { jqw --argjson i "$1" --arg k "$2" --arg v "$3" '.[$i][$k]=$v'; }
 g() { jq -r --argjson i "$IDX" --arg k "$1" '.[$i][$k] // empty' "$NODES"; }
 
 choose_node() { # 交互选择节点并设置 IDX；取消返回 1
-  local n def=0
+  local n def=""
   n=$(jq length "$NODES")
   [[ $n -eq 1 ]] && def=1
   while :; do
     ask "编号（0=返回）" "$def"
-    [[ -z $REPLY || $REPLY == 0 || $REPLY == q ]] && return 1
+    [[ $REPLY == 0 || $REPLY == q ]] && return 1
     if [[ $REPLY =~ ^[0-9]{1,4}$ ]] && ((10#$REPLY >= 1 && 10#$REPLY <= n)); then
       IDX=$((10#$REPLY - 1))
       return 0
     fi
-    err "编号无效（1-$n）"
+    [[ -n $REPLY ]] && err "编号无效（1-$n）"
   done
 }
 
@@ -555,15 +555,20 @@ add_snell() {
 }
 
 menu_add() {
-  title "添加节点"
-  printf "   ${C}1${N}  SOCKS          ${C}4${N}  VLESS (Reality)\n"
-  printf "   ${C}2${N}  Shadowsocks    ${C}5${N}  AnyTLS\n"
-  printf "   ${C}3${N}  Hysteria2      ${C}6${N}  Snell\n"
-  printf "   ${D}0  返回${N}\n"
-  line
-  read -rp "  > " c
+  local c
+  while :; do
+    title "添加节点"
+    printf "   ${C}1${N}  SOCKS          ${C}4${N}  VLESS (Reality)\n"
+    printf "   ${C}2${N}  Shadowsocks    ${C}5${N}  AnyTLS\n"
+    printf "   ${C}3${N}  Hysteria2      ${C}6${N}  Snell\n"
+    printf "   ${C}0${N}  返回\n"
+    line
+    read -rp "  > " c || return
+    [[ -z $c ]] && continue
+    [[ $c == 0 || $c == q ]] && return
+    break
+  done
   echo
-  [[ -z $c || $c == 0 || $c == q ]] && return
   local n
   n=$(jq length "$NODES")
   snapshot
@@ -571,12 +576,11 @@ menu_add() {
     1) add_socks ;; 2) add_ss ;; 3) add_hy2 ;; 4) add_vless ;; 5) add_anytls ;; 6) add_snell ;;
     *)
       err "无效选项"
-      pause
+      sleep 0.8
       return
       ;;
   esac
   if [[ $(jq length "$NODES") -eq $n ]]; then
-    pause
     return
   fi
   IDX=$n
@@ -660,7 +664,7 @@ show_link() {
 menu_links() {
   title "分享链接"
   list_nodes || {
-    pause
+    sleep 1
     return
   }
   local n
@@ -729,7 +733,7 @@ edit_field() {
       pick_ss_method
       jqw --argjson i "$IDX" --arg m "$SS_M" --arg p "$SS_P" '.[$i].method=$m | .[$i].password=$p'
       note "已按新加密方式重新生成密码"
-      pause
+      sleep 0.8
       ;;
     password)
       while :; do
@@ -778,7 +782,7 @@ edit_field() {
           jqw --argjson i "$IDX" --arg p "$(rnd 20)" \
             '.[$i].version=6 | .[$i].mode="default" | .[$i].psk=$p | del(.[$i].obfs, .[$i].obfs_host)'
           note "v6 要求 PSK 12-255 字节，已重新生成"
-          pause
+          sleep 0.8
         fi
       else
         jqw --argjson i "$IDX" '.[$i].version=5 | .[$i].obfs="none" | del(.[$i].mode)'
@@ -816,7 +820,7 @@ edit_field() {
       ;;
     obfs_type)
       pick_hy2_obfs || {
-        pause
+        sleep 0.8
         return 1
       }
       if [[ -n $OBFS_T ]]; then
@@ -825,7 +829,7 @@ edit_field() {
         [[ -n $op ]] || {
           op=$(rnd 16)
           note "已生成混淆密码"
-          pause
+          sleep 0.8
         }
         jqw --argjson i "$IDX" --arg ot "$OBFS_T" --arg op "$op" '.[$i] += {obfs_type:$ot,obfs:$op}'
       else
@@ -870,7 +874,7 @@ edit_field() {
       ;;
     _cert)
       ask_cert || {
-        pause
+        sleep 0.8
         return 1
       }
       jqw --argjson i "$IDX" --arg c "$CERT" --arg k "$KEY" --arg sni "$SNI" --arg h "$HOST" --argjson in "$INSECURE" \
@@ -881,7 +885,7 @@ edit_field() {
       jqw --argjson i "$IDX" --arg priv "$RPRIV" --arg pub "$RPUB" --arg sid "$RSID" \
         '.[$i] += {priv:$priv,pub:$pub,sid:$sid}'
       ok "已生成新的密钥对"
-      pause
+      sleep 0.8
       ;;
     *)
       while :; do
@@ -898,7 +902,7 @@ edit_field() {
 menu_edit() {
   title "编辑节点"
   list_nodes || {
-    pause
+    sleep 1
     return
   }
   line
@@ -918,10 +922,11 @@ menu_edit() {
       printf "   ${C}%-2s${N} %-14s ${D}%s${N}\n" "$i" "${f#*:}" "$v"
       ((i++))
     done
-    printf "   ${D}0  保存并返回${N}\n"
+    printf "   ${C}0${N}  保存并返回\n"
     line
-    read -rp "  > " c
-    [[ -z $c || $c == 0 || $c == q ]] && break
+    read -rp "  > " c || break
+    [[ -z $c ]] && continue
+    [[ $c == 0 || $c == q ]] && break
     if [[ $c =~ ^[0-9]{1,2}$ ]] && ((10#$c >= 1 && 10#$c <= ${#FIELDS[@]})); then
       echo
       edit_field "${FIELDS[$((10#$c - 1))]%%:*}" && dirty=1
@@ -943,7 +948,7 @@ menu_edit() {
 menu_del() {
   title "删除节点"
   list_nodes || {
-    pause
+    sleep 1
     return
   }
   line
@@ -958,35 +963,44 @@ menu_del() {
   else
     rollback "$BAK" "配置应用失败，已撤销删除"
   fi
-  pause
+  sleep 0.8
 }
 
 menu_service() {
-  title "服务管理"
-  local auto="${D}[已关闭]${N}"
-  svc_ctl is-enabled && auto="${G}[已开启]${N}"
-  printf "   ${C}1${N}  启动 / 重启\n   ${C}2${N}  停止服务\n   ${C}3${N}  开机自启  %s\n   ${D}0  返回${N}\n" "$auto"
-  line
-  read -rp "  > " c
-  [[ -z $c || $c == 0 || $c == q ]] && return
-  case $c in
-    1) apply ;;
-    2)
-      svc_ctl stop
-      ok "服务已停止"
-      ;;
-    3)
-      if svc_ctl is-enabled; then
-        svc_ctl disable
-        ok "已关闭开机自启"
-      else
-        svc_ctl enable
-        ok "已开启开机自启"
-      fi
-      ;;
-    *) return ;;
-  esac
-  pause
+  local c auto
+  while :; do
+    title "服务管理"
+    auto="${D}[已关闭]${N}"
+    svc_ctl is-enabled && auto="${G}[已开启]${N}"
+    printf "   ${C}1${N}  启动 / 重启\n   ${C}2${N}  停止服务\n   ${C}3${N}  开机自启  %s\n   ${C}0${N}  返回\n" "$auto"
+    line
+    read -rp "  > " c || return
+    [[ -z $c ]] && continue
+    [[ $c == 0 || $c == q ]] && return
+    case $c in
+      1) apply ;;
+      2)
+        svc_ctl stop
+        ok "服务已停止"
+        ;;
+      3)
+        if svc_ctl is-enabled; then
+          svc_ctl disable
+          ok "已关闭开机自启"
+        else
+          svc_ctl enable
+          ok "已开启开机自启"
+        fi
+        ;;
+      *)
+        err "无效选项"
+        sleep 0.8
+        continue
+        ;;
+    esac
+    sleep 0.8
+    return
+  done
 }
 
 uninstall() {
@@ -1030,7 +1044,7 @@ main_menu() {
     printf "   ${C}2${N}  添加节点       ${C}7${N}  运行日志\n"
     printf "   ${C}3${N}  编辑节点       ${C}8${N}  更新内核\n"
     printf "   ${C}4${N}  删除节点       ${C}9${N}  彻底卸载\n"
-    printf "   ${C}5${N}  分享链接       ${D}0  退出${N}\n"
+    printf "   ${C}5${N}  分享链接       ${C}0${N}  退出\n"
     line
     read -rp "  > " c || exit 0
     case $c in
@@ -1049,7 +1063,7 @@ main_menu() {
       8)
         title "更新内核"
         install_singbox && apply
-        pause
+        sleep 1
         ;;
       9) uninstall ;;
       0 | q)
@@ -1067,7 +1081,7 @@ if ! sb_installed; then
   info "未检测到 sing-box"
   confirm "是否安装？" || exit 0
   install_singbox || exit 1
-  pause
+  sleep 0.8
 fi
 init_dirs
 if [[ -f $0 && $(readlink -f "$0") != /usr/local/bin/sb ]]; then
