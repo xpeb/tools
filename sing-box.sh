@@ -75,12 +75,15 @@ RUN_TMP=$(mktemp -d -t sb-panel.XXXXXX) || {
 }
 LOCK_DIR=""
 cleanup() {
-  [[ -n $LOCK_DIR ]] && rmdir "$LOCK_DIR" 2>/dev/null || true
+  if [[ -n $LOCK_DIR ]]; then
+    rm -f "$LOCK_DIR/pid" 2>/dev/null || true
+    rmdir "$LOCK_DIR" 2>/dev/null || true
+  fi
   [[ -n $RUN_TMP ]] && rm -rf "$RUN_TMP"
   rm -f "$SB_DIR"/.tmp.* 2>/dev/null || true
 }
 trap cleanup EXIT
-trap 'cleanup; echo; exit 130' INT TERM
+trap 'cleanup; echo; exit 130' INT TERM HUP
 
 acquire_lock() {
   mkdir -p "$SB_DIR" && chmod 700 "$SB_DIR"
@@ -569,8 +572,10 @@ ask_sni() { # $1=提示 $2=变量名（默认 SNI）
 
 _cert_valid() {
   [[ -s $1 && -s $2 ]] || return 1
-  openssl x509 -in "$1" -noout >/dev/null 2>&1 || return 1
-  openssl pkey -in "$2" -noout >/dev/null 2>&1
+  local cp kp
+  cp=$(openssl x509 -in "$1" -pubkey -noout 2>/dev/null) || return 1
+  kp=$(openssl pkey -in "$2" -pubout 2>/dev/null) || return 1
+  [[ -n $cp && $cp == "$kp" ]]
 }
 
 ask_cert() {
@@ -608,7 +613,8 @@ ask_cert() {
         continue
       fi
       while :; do
-        ask "客户端连接地址（留空=自动用服务器 IP）" "$SNI" || return 1
+        ask "客户端连接地址（-=自动用服务器 IP）" "$SNI" || return 1
+        [[ $REPLY == "-" ]] && REPLY=""
         valid_host "$REPLY" && {
           HOST=$REPLY
           break
@@ -1113,8 +1119,15 @@ edit_field() { # return 0=需重启生效; 2=仅影响分享链接(无需重启)
       while :; do
         ask "新节点名称（0=取消）" "$cur" || return 1
         [[ $REPLY == 0 || $REPLY == "$cur" ]] && return 1
-        [[ $REPLY =~ ^[A-Za-z0-9._-]+$ ]] && break
-        err "名称仅支持字母、数字、点、下划线和连字符"
+        if [[ ! $REPLY =~ ^[A-Za-z0-9._-]+$ ]]; then
+          err "名称仅支持字母、数字、点、下划线和连字符"
+          continue
+        fi
+        if jq -e --arg t "$REPLY" --argjson ex "$IDX" 'to_entries | any(.[]; .key != $ex and .value.tag == $t)' "$NODES" >/dev/null 2>&1; then
+          err "节点名称已存在"
+          continue
+        fi
+        break
       done
       setf "$IDX" tag "$REPLY"
       ;;
@@ -1255,11 +1268,11 @@ menu_edit() {
         [[ -z $v ]] && v="—"
       fi
       printf '%s%s%s%s%s%s%s\n' \
-        "$C" "$(_pad_left "$i" 3)" "$N" "$(_pad_left "${f#*:}" 16)" "$D" "$v" "$N"
+        "$C" "$(_pad_left "$i" 3)" "$N" "$(_pad_left "${f#*:}" 20)" "$D" "$v" "$N"
       ((i++))
     done
     printf '%s%s%s%s%s%s\n' \
-      "$C" "$(_pad_left "0" 3)" "$N" "$(_pad_left "保存并返回" 16)" "${C}q${N}  " "放弃修改"
+      "$C" "$(_pad_left "0" 3)" "$N" "$(_pad_left "保存并返回" 20)" "${C}q${N}  " "放弃修改"
     read -rp "> " c || {
       cp "$BAK_NODES" "$NODES"
       chmod 600 "$NODES"
