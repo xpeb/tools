@@ -16,8 +16,6 @@ DEFAULT_SNI=www.apache.org
 
 # ───────── UI ─────────
 B=$'\e[1m' D=$'\e[2m' G=$'\e[32m' R=$'\e[31m' Y=$'\e[33m' C=$'\e[36m' N=$'\e[0m'
-RULE="──────────────────────────────────────────"
-line() { printf "  ${D}%s${N}\n" "$RULE"; }
 info() { printf "  ${D}[信息]${N} %s\n" "$*"; }
 note() { printf "  ${C}[注意]${N} %s\n" "$*"; }
 warn() { printf "  ${Y}[警告]${N} %s\n" "$*"; }
@@ -39,8 +37,7 @@ confirm() {
 }
 title() {
   header
-  printf "  ${B}%s${N}\n" "$1"
-  line
+  printf "  ${C}▸${N} ${B}%s${N}\n\n" "$1"
 }
 
 RUN_TMP=$(mktemp -d -t sb-panel.XXXXXX)
@@ -558,11 +555,10 @@ menu_add() {
   local c
   while :; do
     title "添加节点"
-    printf "   ${C}1${N}  SOCKS          ${C}4${N}  VLESS (Reality)\n"
-    printf "   ${C}2${N}  Shadowsocks    ${C}5${N}  AnyTLS\n"
-    printf "   ${C}3${N}  Hysteria2      ${C}6${N}  Snell\n"
-    printf "   ${C}0${N}  返回\n"
-    line
+    printf "   ${C}1${N}  VLESS          ${C}2${N}  Hysteria2\n"
+    printf "   ${C}3${N}  AnyTLS         ${C}4${N}  Snell\n"
+    printf "   ${C}5${N}  Shadowsocks    ${C}6${N}  SOCKS\n"
+    printf "   ${C}0${N}  返回\n\n"
     read -rp "  > " c || return
     [[ -z $c ]] && continue
     [[ $c == 0 ]] && return
@@ -575,7 +571,7 @@ menu_add() {
   n=$(jq length "$NODES")
   snapshot
   case $c in
-    1) add_socks ;; 2) add_ss ;; 3) add_hy2 ;; 4) add_vless ;; 5) add_anytls ;; 6) add_snell ;;
+    1) add_vless ;; 2) add_hy2 ;; 3) add_anytls ;; 4) add_snell ;; 5) add_ss ;; 6) add_socks ;;
   esac
   if [[ $(jq length "$NODES") -eq $n ]]; then
     return
@@ -666,7 +662,7 @@ menu_links() {
   }
   local n
   n=$(jq length "$NODES")
-  line
+  echo
   local i
   while :; do
     ask "编号（a=全部，0=返回）" "a"
@@ -894,7 +890,7 @@ menu_edit() {
     sleep 1
     return
   }
-  line
+  echo
   choose_node || return
   local dirty=0 i f k v
   snapshot
@@ -912,7 +908,7 @@ menu_edit() {
       ((i++))
     done
     printf "   ${C}0${N}  保存并返回\n"
-    line
+    echo
     read -rp "  > " c || break
     [[ -z $c ]] && continue
     [[ $c == 0 ]] && break
@@ -940,7 +936,7 @@ menu_del() {
     sleep 1
     return
   }
-  line
+  echo
   choose_node || return
   local port
   port=$(g port)
@@ -962,7 +958,7 @@ menu_service() {
     auto="${D}[已关闭]${N}"
     svc_ctl is-enabled && auto="${G}[已开启]${N}"
     printf "   ${C}1${N}  启动 / 重启\n   ${C}2${N}  停止服务\n   ${C}3${N}  开机自启  %s\n   ${C}0${N}  返回\n" "$auto"
-    line
+    echo
     read -rp "  > " c || return
     [[ -z $c ]] && continue
     [[ $c == 0 ]] && return
@@ -1023,7 +1019,7 @@ header() {
   else
     printf "  ${B}sing-box${N}\n"
   fi
-  line
+  echo
 }
 
 main_menu() {
@@ -1034,7 +1030,7 @@ main_menu() {
     printf "   ${C}3${N}  编辑节点       ${C}8${N}  更新内核\n"
     printf "   ${C}4${N}  删除节点       ${C}9${N}  彻底卸载\n"
     printf "   ${C}5${N}  分享链接       ${C}0${N}  退出\n"
-    line
+    echo
     read -rp "  > " c || exit 0
     case $c in
       1)
