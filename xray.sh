@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Xray-core 极简交互式面板（仅支持 Debian / Alpine）
-# 协议：SOCKS / Shadowsocks / Trojan(TLS) / VLESS(Reality: RAW/XHTTP) / VMess(WS+TLS) / Hysteria2
+# Xray-core 极简交互式面板（支持 Debian systemd / Alpine OpenRC，Alpine 需预装 bash）
+# 支持协议：VLESS (Reality: RAW/XHTTP) / Hysteria2 / Trojan (TLS) / VMess (WS+TLS) / Shadowsocks / SOCKS5
 
 export PATH="$PATH:/usr/local/sbin:/usr/sbin:/sbin"
 
@@ -13,60 +13,126 @@ XR_LOG=/var/log/xray.log
 SCRIPT_URL="https://raw.githubusercontent.com/xpeb/vps-tools/main/xray.sh"
 DEFAULT_SNI=www.apache.org
 
-[[ $EUID -eq 0 ]] || {
-  echo "请用 root 运行"
-  exit 1
-}
+[[ $EUID -eq 0 ]] || { echo "请使用 root 权限运行此脚本"; exit 1; }
 if command -v apt-get >/dev/null && command -v systemctl >/dev/null; then
   OS=debian
 elif command -v apk >/dev/null && command -v rc-service >/dev/null; then
   OS=alpine
 else
-  echo "仅支持 Debian (systemd) 或 Alpine (OpenRC)"
+  echo "当前系统不受支持，仅兼容 Debian (systemd) 与 Alpine (OpenRC)"
   exit 1
 fi
 
-# ───────── UI ─────────
+# ───────── 界面样式与交互辅助 ─────────
 B=$'\e[1m' D=$'\e[2m' G=$'\e[32m' R=$'\e[31m' Y=$'\e[33m' C=$'\e[36m' N=$'\e[0m'
-info() { printf "${D}[信息]${N} %s\n" "$*"; }
-note() { printf "${C}[注意]${N} %s\n" "$*"; }
-warn() { printf "${Y}[警告]${N} %s\n" "$*"; }
-ok() { printf "${G}[正确]${N} %s\n" "$*"; }
-err() { printf "${R}[错误]${N} %s\n" "$*"; }
-pause() {
-  echo
-  read -rsp "按回车返回…" _
-  echo
-}
-title() {
-  header
-  printf "${C}▸${N} ${B}%s${N}\n" "$1"
+RULE="${D}────────────────────────────────────────────────${N}"
+_UTF8_CHAR="中"
+
+info() { printf "${D}·${N} %s\n" "$*"; }
+note() { printf "${C}i${N} %s\n" "$*"; }
+warn() { printf "${Y}!${N} %s\n" "$*"; }
+ok() { printf "${G}✓${N} %s\n" "$*"; }
+err() { printf "${R}✗${N} %s\n" "$*"; }
+
+pad_print() { # $1=文本 $2=目标宽度 [$3=前缀色 [$4=后缀色]]
+  local s=$1 target=$2 pre=${3:-} suf=${4:-} ascii w pad
+  ascii=${s//[^ -~]/}
+  if ((${#_UTF8_CHAR} == 1)); then
+    w=$((${#s} * 2 - ${#ascii}))
+  else
+    w=$((${#ascii} + (${#s} - ${#ascii}) * 2 / 3))
+  fi
+  pad=$((target - w))
+  ((pad < 1)) && pad=1
+  printf "%s%s%s%*s" "$pre" "$s" "$suf" "$pad" ""
 }
 
-ask() { # $1=提示 $2=默认 -> REPLY
+pause() {
+  echo
+  read -rsp "${D}按回车键返回…${N}" _
+  echo
+}
+
+title() {
+  header
+  printf "${C}▸${N} ${B}%s${N}\n\n" "$1"
+}
+
+ask() { # $1=提示 $2=默认值 -> REPLY；EOF 返回 1
   if [[ -n $2 ]]; then
-    read -rp "$1 [$2]: " REPLY
+    read -rp "${B}$1${N} ${D}[$2]${N}: " REPLY || return 1
     REPLY=${REPLY:-$2}
   else
-    read -rp "$1: " REPLY
+    read -rp "${B}$1${N}: " REPLY || return 1
   fi
 }
 
-confirm() {
-  read -rp "$1 [y/N]: " REPLY
+ask_c() { ask "$@" && [[ $REPLY != 0 ]] || return 2; } # 支持 0 / EOF 取消（返回 2）
+
+confirm() { # $1=提示；默认 N
+  read -rp "${Y}?${N} $1 ${D}[y/N]${N}: " REPLY || return 1
   [[ $REPLY =~ ^[Yy]$ ]]
 }
 
-RUN_TMP=$(mktemp -d -t xr-panel.XXXXXX)
+prompt_choice() {
+  echo
+  read -rp "${C}›${N} " REPLY
+}
+
+proto_name() {
+  case $1 in
+    vless) echo "VLESS" ;;
+    hysteria2) echo "Hysteria2" ;;
+    trojan) echo "Trojan" ;;
+    vmess) echo "VMess" ;;
+    shadowsocks) echo "Shadowsocks" ;;
+    socks) echo "SOCKS5" ;;
+    *) echo "$1" ;;
+  esac
+}
+
+proto_l4() {
+  case $1 in
+    hysteria2) echo udp ;;
+    shadowsocks | socks) echo both ;;
+    *) echo tcp ;;
+  esac
+}
+
+l4_label() {
+  case $1 in
+    udp) echo UDP ;;
+    both) echo TCP+UDP ;;
+    *) echo TCP ;;
+  esac
+}
+
+RUN_TMP=$(mktemp -d -t xr-panel.XXXXXX) || { err "无法创建临时目录"; exit 1; }
 CONF_TMP="$RUN_TMP/config.json"
 PENDING_BAK=""
-cleanup() {
-  if [[ -n ${PENDING_BAK:-} && -f $PENDING_BAK && -n ${NODES:-} ]]; then
-    cp "$PENDING_BAK" "$NODES" 2>/dev/null || true
-    chmod 600 "$NODES" 2>/dev/null || true
-    PENDING_BAK=""
+CONF_DIRTY=0
+
+node_count() { [[ -f $NODES ]] && jq length "$NODES" 2>/dev/null || echo 0; }
+xr_installed() { [[ -x $XR_BIN ]]; }
+xr_version() { "$XR_BIN" version 2>/dev/null | awk 'NR==1{print $2}'; }
+
+_restore_snapshot() { # $1=快照文件
+  local bak=$1
+  [[ -n $bak && -f $bak && -n ${NODES:-} ]] || return 0
+  cp "$bak" "$NODES" 2>/dev/null || true
+  chmod 600 "$NODES" 2>/dev/null || true
+  if [[ ${CONF_DIRTY:-0} == 1 ]] && xr_installed; then
+    if gen_config 2>/dev/null && chmod 600 "$CONF_TMP" 2>/dev/null && mv "$CONF_TMP" "$CONF" 2>/dev/null; then
+      (($(node_count) == 0)) && svc_ctl stop || svc_ctl restart
+    fi
   fi
-  [[ -n $RUN_TMP ]] && rm -rf "$RUN_TMP"
+  PENDING_BAK=""
+  CONF_DIRTY=0
+}
+
+cleanup() {
+  _restore_snapshot "${PENDING_BAK:-}"
+  [[ -n ${RUN_TMP:-} ]] && rm -rf "$RUN_TMP"
 }
 trap cleanup EXIT
 trap 'cleanup; echo; exit 130' INT TERM
@@ -79,12 +145,13 @@ ensure_deps() {
     [[ $c == ss ]] && pk+=(iproute2) || pk+=("$c")
   done
   [[ ${#pk[@]} -eq 0 ]] && return 0
+  info "正在安装必要依赖：${pk[*]}…"
   if [[ $OS == debian ]]; then
     apt-get update -qq >"$log" 2>&1 && apt-get install -y -qq "${pk[@]}" ca-certificates >>"$log" 2>&1
   else
     apk add --no-cache "${pk[@]}" ca-certificates >"$log" 2>&1
   fi || {
-    err "依赖安装失败"
+    err "依赖安装失败，请检查软件源或网络连接"
     tail -n 20 "$log" 2>/dev/null
     exit 1
   }
@@ -101,7 +168,7 @@ After=network.target nss-lookup.target
 ExecStart=$XR_BIN run -c $CONF
 Restart=on-failure
 RestartSec=5s
-LimitNOFILE=infinity
+LimitNOFILE=1048576
 
 [Install]
 WantedBy=multi-user.target
@@ -166,9 +233,9 @@ svc_logs() {
     out=$(tail -n 40 "$XR_LOG" 2>/dev/null)
   fi
   if [[ -n $out ]]; then
-    printf '%s\n' "$out" | cat
+    printf "${D}最近 40 条日志：${N}\n%s\n%s\n" "$RULE" "$out"
   else
-    info "暂无日志"
+    info "暂无运行日志"
   fi
 }
 
@@ -176,97 +243,87 @@ _fetch_ip() { # $1=-4|-6 $2=regex
   local ip u
   for u in https://api${1#-}.ipify.org https://ip.sb https://ifconfig.me; do
     ip=$(curl -s "$1" -m 2 "$u" 2>/dev/null | tr -d '[:space:]')
-    [[ $ip =~ $2 ]] && {
-      echo "$ip"
-      return 0
-    }
+    [[ $ip =~ $2 ]] && { echo "$ip"; return 0; }
   done
 }
 
 detect_ips() {
   [[ -n ${IP_DETECTED:-} ]] && return
   IP_DETECTED=1
+  printf "${D}· 正在检测公网 IP…${N}"
   _fetch_ip -4 '^[0-9.]+$' >"$RUN_TMP/ip4" &
   _fetch_ip -6 '^[0-9a-fA-F:]+:[0-9a-fA-F:]*$' >"$RUN_TMP/ip6" &
   wait
+  printf "\r\033[K"
   [[ -s $RUN_TMP/ip4 ]] && PUBIP4=$(<"$RUN_TMP/ip4") || PUBIP4=""
   [[ -s $RUN_TMP/ip6 ]] && PUBIP6=$(<"$RUN_TMP/ip6") || PUBIP6=""
 }
 
-xr_installed() { [[ -x $XR_BIN ]]; }
-xr_version() { "$XR_BIN" version 2>/dev/null | awk 'NR==1{print $2}'; }
 init_dirs() {
   mkdir -p "$XR_DIR" "$CERT_DIR" && chmod 700 "$XR_DIR" "$CERT_DIR"
-  [[ -f $NODES ]] || {
-    echo '[]' >"$NODES"
-    chmod 600 "$NODES"
-  }
+  [[ -f $NODES ]] || { echo '[]' >"$NODES"; chmod 600 "$NODES"; }
+}
+
+_download_xray() { # $1=ver $2=arch $3=tmp_dir
+  local base_url="https://github.com/XTLS/Xray-core/releases/download/v$1/Xray-linux-$2.zip"
+  local expected actual
+  info "正在下载 Xray-core v$1（$2）…"
+  curl -fsSL -o "$3/xr.zip" "$base_url" 2>/dev/null || { err "安装包下载失败"; return 1; }
+  info "正在校验安装包 SHA256…"
+  curl -fsSL -o "$3/xr.zip.dgst" "$base_url.dgst" 2>/dev/null || { err "校验文件下载失败，已中止安装"; return 1; }
+  expected=$(awk -F'=' '/^SHA2?-?256[[:space:]]*=/{gsub(/[[:space:]]/, "", $2); print $2; exit}' "$3/xr.zip.dgst")
+  [[ -n $expected ]] || { err "无法解析安装包 SHA256 校验值"; return 1; }
+  actual=$(sha256sum "$3/xr.zip" | awk '{print $1}')
+  [[ $expected == "$actual" ]] || { err "安装包 SHA256 校验未通过，文件可能已损坏"; return 1; }
+  info "正在安装二进制文件与系统服务…"
+  if ! unzip -qo "$3/xr.zip" xray -d "$3" 2>/dev/null \
+    || ! install -m755 "$3/xray" "$XR_BIN.new" 2>/dev/null \
+    || ! mv -f "$XR_BIN.new" "$XR_BIN" 2>/dev/null; then
+    rm -f "$XR_BIN.new"
+    err "解压或写入可执行文件失败"
+    return 1
+  fi
 }
 
 install_xray() {
-  local arch ver tmp
+  local arch ver tmp eff_url v rc=0
   case $(uname -m) in
     x86_64 | amd64) arch=64 ;;
     aarch64 | arm64) arch=arm64-v8a ;;
     armv7l) arch=arm32-v7a ;;
     i386 | i686) arch=32 ;;
-    *)
-      err "不支持的架构：$(uname -m)"
-      return 1
-      ;;
+    *) err "不支持的系统架构：$(uname -m)"; return 1 ;;
   esac
-  local eff_url=""
+  info "正在查询最新 Xray-core 版本…"
   eff_url=$(curl -fsSLI -m 10 -o /dev/null -w '%{url_effective}' https://github.com/XTLS/Xray-core/releases/latest 2>/dev/null)
   ver=${eff_url##*/}
   ver=${ver#v}
   if [[ -z $ver || $ver == latest ]]; then
     ver=$(curl -fsSL -m 10 https://api.github.com/repos/XTLS/Xray-core/releases/latest 2>/dev/null | jq -r '.tag_name // empty' | sed 's/^v//')
   fi
-  if [[ -z $ver ]]; then
-    err "获取最新版本失败"
-    return 1
-  elif xr_installed && [[ $(xr_version) == "$ver" ]]; then
+  [[ -n $ver ]] || { err "获取最新版本信息失败，请检查网络连接"; return 1; }
+  if xr_installed && [[ $(xr_version) == "$ver" ]]; then
     ok "当前已是最新版本 v$ver"
-    confirm "是否强制重新安装？" || return 1
+    confirm "是否强制重新安装？" || return 2
   fi
-  tmp=$(mktemp -d "$RUN_TMP"/dl.XXXXXX)
-  local base_url="https://github.com/XTLS/Xray-core/releases/download/v$ver/Xray-linux-$arch.zip"
-  if ! curl -fsSL -o "$tmp/xr.zip" "$base_url" 2>/dev/null; then
-    err "下载失败"
-    rm -rf "$tmp"
-    return 1
-  fi
-  if curl -fsSL -o "$tmp/xr.zip.dgst" "$base_url.dgst" 2>/dev/null; then
-    local expected actual
-    expected=$(awk '/^SHA2-256=/{print $2; exit}' "$tmp/xr.zip.dgst" | tr -d '[:space:]')
-    actual=$(sha256sum "$tmp/xr.zip" | awk '{print $1}')
-    if [[ -n $expected && $expected != "$actual" ]]; then
-      err "安装包 SHA256 校验失败"
-      rm -rf "$tmp"
-      return 1
-    fi
-  fi
-  if ! unzip -qo "$tmp/xr.zip" xray -d "$tmp" 2>/dev/null || ! install -m755 "$tmp/xray" "$XR_BIN" 2>/dev/null; then
-    err "解压或安装失败"
-    rm -rf "$tmp"
-    return 1
-  fi
+  tmp=$(mktemp -d "$RUN_TMP"/dl.XXXXXX) || { err "创建临时下载目录失败"; return 1; }
+  _download_xray "$ver" "$arch" "$tmp" || rc=$?
   rm -rf "$tmp"
+  ((rc == 0)) || return 1
   init_dirs
   svc_install
-  local v
   v=$(xr_version)
-  if [[ -z $v ]]; then
-    err "安装后无法执行"
-    return 1
-  fi
-  ok "Xray-core $v 已安装"
+  [[ -n $v ]] || { err "安装完成但无法执行 Xray-core"; return 1; }
+  ok "Xray-core v$v 安装完成"
 }
 
-# ───────── 配置生成（严格遵循 Xray-core 官方文档标准）─────────
+# ───────── 配置生成（遵循 Xray-core 官方标准）─────────
 gen_config() {
   local listen_ip="::"
-  [[ -f /proc/net/if_inet6 ]] || listen_ip="0.0.0.0"
+  if [[ ! -s /proc/net/if_inet6 ]] \
+    || { [[ $(cat /proc/sys/net/ipv6/bindv6only 2>/dev/null) == 1 ]] && ip -4 route show default 2>/dev/null | grep -q .; }; then
+    listen_ip="0.0.0.0"
+  fi
   jq --arg l "$listen_ip" '{
     log: {loglevel: "warning"},
     inbounds: map(
@@ -285,7 +342,7 @@ gen_config() {
           tag: .tag, listen: $l, port: .port, protocol: "trojan",
           settings: {users: [{password: .password}]},
           streamSettings: {
-            method: "raw", security: "tls",
+            network: "raw", security: "tls",
             tlsSettings: {alpn: ["h2", "http/1.1"], certificates: [{certificateFile: .cert, keyFile: .key}]}
           }
         }
@@ -298,7 +355,7 @@ gen_config() {
           },
           streamSettings: (
             {
-              method: (.transport // "raw"),
+              network: (.transport // "raw"),
               security: "reality",
               realitySettings: {
                 target: (.sni + ":443"), serverNames: [.sni],
@@ -312,7 +369,7 @@ gen_config() {
           tag: .tag, listen: $l, port: .port, protocol: "vmess",
           settings: {users: [{id: .uuid}]},
           streamSettings: {
-            method: "websocket",
+            network: "websocket",
             wsSettings: {path: .path},
             security: "tls",
             tlsSettings: {alpn: ["http/1.1"], certificates: [{certificateFile: .cert, keyFile: .key}]}
@@ -323,7 +380,7 @@ gen_config() {
           tag: .tag, listen: $l, port: .port, protocol: "hysteria",
           settings: {version: 2, users: [{auth: .password}]},
           streamSettings: {
-            method: "hysteria",
+            network: "hysteria",
             hysteriaSettings: {version: 2},
             security: "tls",
             tlsSettings: {alpn: ["h3"], certificates: [{certificateFile: .cert, keyFile: .key}]}
@@ -333,252 +390,273 @@ gen_config() {
         sniffing: {enabled: true, destOverride: ["http", "tls", "quic"]}
       }
     ),
-    outbounds: [{protocol: "freedom", tag: "direct"}],
-    routing: {domainStrategy: "AsIs", rules: []}
+    outbounds: [
+      {protocol: "freedom", tag: "direct"},
+      {protocol: "blackhole", tag: "block"}
+    ],
+    routing: {
+      domainStrategy: "AsIs",
+      rules: [
+        {
+          type: "field",
+          ip: [
+            "127.0.0.0/8", "10.0.0.0/8", "172.16.0.0/12",
+            "192.168.0.0/16", "169.254.0.0/16",
+            "::1/128", "fc00::/7", "fe80::/10"
+          ],
+          outboundTag: "block"
+        }
+      ]
+    }
   }' "$NODES" >"$CONF_TMP"
 }
 
 apply() {
-  gen_config
-  local out
+  info "正在校验并应用配置…"
+  gen_config || { err "生成配置文件失败"; rm -f "$CONF_TMP"; return 1; }
+  local out i
   if ! out=$("$XR_BIN" run -test -c "$CONF_TMP" 2>&1); then
-    err "配置校验失败"
-    echo "$out" | cat
+    err "配置校验未通过："
+    printf '%s\n' "$out"
     rm -f "$CONF_TMP"
     return 1
   fi
   if ! { chmod 600 "$CONF_TMP" && mv "$CONF_TMP" "$CONF"; }; then
-    err "写入配置失败"
+    err "写入配置文件失败"
     rm -f "$CONF_TMP"
     return 1
   fi
-  if [[ $(jq length "$NODES") -eq 0 ]]; then
+  CONF_DIRTY=1
+  if (($(node_count) == 0)); then
     svc_ctl stop
     PENDING_BAK=""
-    ok "节点已清空，服务已停止"
+    CONF_DIRTY=0
+    ok "当前无可用节点，已自动停止服务"
     return 0
   fi
   svc_ctl enable
   svc_ctl restart
-  local i
   for i in 1 2 3 4 5 6; do
     sleep 0.5
     svc_ctl is-active && {
       PENDING_BAK=""
-      ok "配置已生效"
+      CONF_DIRTY=0
+      ok "配置已生效，服务运行正常"
       return 0
     }
   done
-  err "服务启动失败，请查看日志"
+  err "服务未能正常启动，请前往「运行日志」排查原因"
   return 1
 }
 
-# ───────── 通用辅助 ─────────
+# ───────── 通用校验与辅助 ─────────
 rnd() { tr -dc 'A-Za-z0-9' </dev/urandom | head -c "${1:-16}"; }
 valid_port() { [[ $1 =~ ^[0-9]{1,5}$ ]] && ((10#$1 >= 1 && 10#$1 <= 65535)); }
 valid_sni() { [[ $1 =~ ^[A-Za-z0-9.-]+$ && $1 != .* && $1 != *. && $1 != *..* ]]; }
 valid_path() { [[ $1 == /* && ! $1 =~ [[:space:]] ]]; }
 valid_ss2022_psk() {
-  local need=16 raw
+  local need=16 decoded
   [[ $1 == 2022-blake3-aes-128-gcm ]] || need=32
-  raw=$(printf %s "$2" | base64 -d 2>/dev/null | wc -c)
-  ((raw == need))
+  [[ $2 =~ ^[A-Za-z0-9+/]+=*$ ]] || return 1
+  decoded=$(printf %s "$2" | base64 -d 2>/dev/null | wc -c; exit "${PIPESTATUS[1]}") || return 1
+  ((decoded == need))
 }
 
-port_free() {
-  ! ss -lntu 2>/dev/null | awk 'NR>1{print $5}' | grep -qE "[:.]$1$" \
-    && ! jq -e --argjson p "$1" 'any(.[]; .port == $p)' "$NODES" >/dev/null 2>&1
+port_free() { # $1=port $2=tcp|udp|both(默认 both)
+  local p=$1 l4=${2:-both} ss_opt="-lntu"
+  case $l4 in
+    tcp) ss_opt="-lnt" ;;
+    udp) ss_opt="-lnu" ;;
+  esac
+  ! ss "$ss_opt" 2>/dev/null | awk 'NR>1{print $5}' | grep -qE "[:.]$p$" \
+    && ! jq -e --argjson p "$p" --arg l4 "$l4" '
+      def l4of: if .type == "hysteria2" then "udp"
+                elif .type == "shadowsocks" or .type == "socks" then "both"
+                else "tcp" end;
+      any(.[]; .port == $p and ($l4 == "both" or l4of == "both" or l4of == $l4))
+    ' "$NODES" >/dev/null 2>&1
 }
 
-ask_port() {
-  local def
+ask_port() { # $1=协议类型；取消返回 2
+  local l4 l4_txt def
+  l4=$(proto_l4 "$1")
+  l4_txt=$(l4_label "$l4")
   while :; do
     def=$((20000 + RANDOM % 30000))
-    port_free "$def" && break
+    port_free "$def" "$l4" && break
   done
   while :; do
-    ask "端口" "$def"
-    valid_port "$REPLY" || {
-      err "端口无效 (1-65535)"
-      continue
-    }
+    ask_c "监听端口（$l4_txt）" "$def" || return 2
+    valid_port "$REPLY" || { err "端口无效，请输入 1-65535 之间的整数"; continue; }
     PORT=$((10#$REPLY))
-    port_free "$PORT" && return 0
-    err "端口 $PORT 已被占用"
+    port_free "$PORT" "$l4" && return 0
+    err "端口 $PORT（$l4_txt）已被占用，请更换其他端口"
   done
 }
 
-ask_sni() { # $1=提示 $2=变量名（默认 SNI）
+ask_sni() { # $1=提示 $2=变量名（默认 SNI）；取消返回 2
   local var=${2:-SNI}
   while :; do
-    ask "$1" "$DEFAULT_SNI"
-    valid_sni "$REPLY" && {
-      printf -v "$var" '%s' "$REPLY"
-      return 0
-    }
-    err "域名 / SNI 格式无效（不能含空格、斜杠或冒号）"
+    ask_c "$1" "$DEFAULT_SNI" || return 2
+    valid_sni "$REPLY" && { printf -v "$var" '%s' "$REPLY"; return 0; }
+    err "域名 / SNI 格式无效（仅支持字母、数字、点与连字符）"
   done
 }
 
-ask_path() { # $1=提示 $2=默认值 $3=变量名
+ask_path() { # $1=提示 $2=默认值 $3=变量名；取消返回 2
   local var=${3:-WPATH}
   while :; do
-    ask "$1" "$2"
-    valid_path "$REPLY" && {
-      printf -v "$var" '%s' "$REPLY"
-      return 0
-    }
-    err "路径须以 / 开头且不含空格"
+    ask_c "$1" "$2" || return 2
+    valid_path "$REPLY" && { printf -v "$var" '%s' "$REPLY"; return 0; }
+    err "路径须以 / 开头且不能包含空白字符"
   done
 }
 
-ask_cert() {
-  ask_sni "域名 / SNI" SNI
+gen_self_cert() { # $1=sni -> 设置 CERT 和 KEY
+  local sni=$1
+  CERT=$CERT_DIR/$sni.crt
+  KEY=$CERT_DIR/$sni.key
+  if [[ ! -f $CERT || ! -f $KEY ]]; then
+    local ossl=(req -x509 -nodes -newkey ec -pkeyopt ec_paramgen_curve:prime256v1
+      -keyout "$KEY" -out "$CERT" -days 3650 -subj "/CN=$sni")
+    openssl "${ossl[@]}" -addext "subjectAltName=DNS:$sni" >/dev/null 2>&1 \
+      || openssl "${ossl[@]}" >/dev/null 2>&1 \
+      || { err "自签证书生成失败"; rm -f "$CERT" "$KEY"; return 1; }
+    chmod 600 "$KEY"
+    chmod 644 "$CERT"
+  fi
+}
+
+ask_cert() { # $1=1 显示取消提示；返回 0=成功 1=错误 2=取消
+  local sfx=""
+  [[ ${1:-0} == 1 ]] && sfx="（0 取消）"
+  ask_sni "域名 / SNI$sfx" SNI || return 2
   while :; do
-    ask "证书路径（留空=自签，0=取消）" ""
-    [[ $REPLY == 0 ]] && return 1
+    ask_c "证书路径（留空自动自签${sfx:+，0 取消}）" "" || return 2
     CERT=$REPLY
     if [[ -z $CERT ]]; then
-      CERT=$CERT_DIR/$SNI.crt
-      KEY=$CERT_DIR/$SNI.key
-      if [[ ! -f $CERT || ! -f $KEY ]]; then
-        local ossl=(req -x509 -nodes -newkey ec -pkeyopt ec_paramgen_curve:prime256v1
-          -keyout "$KEY" -out "$CERT" -days 3650 -subj "/CN=$SNI")
-        openssl "${ossl[@]}" -addext "subjectAltName=DNS:$SNI" >/dev/null 2>&1 \
-          || openssl "${ossl[@]}" >/dev/null 2>&1 \
-          || {
-            err "自签证书生成失败"
-            rm -f "$CERT" "$KEY"
-            return 1
-          }
-        chmod 600 "$KEY"
-        chmod 644 "$CERT"
-      fi
+      gen_self_cert "$SNI" || return 1
       INSECURE=1
       HOST=""
-      return 0
-    else
-      ask "私钥路径（0=取消）" ""
-      [[ $REPLY == 0 ]] && return 1
-      KEY=$REPLY
-      if [[ ! -f $CERT || ! -f $KEY ]]; then
-        err "证书或私钥文件不存在（留空证书路径可改用自签）"
-        continue
-      fi
-      if ! openssl x509 -noout -in "$CERT" >/dev/null 2>&1 || ! openssl pkey -noout -in "$KEY" >/dev/null 2>&1; then
-        err "证书或私钥格式无效（需为 PEM 格式）"
-        continue
-      fi
-      INSECURE=0
-      HOST=$SNI
+      info "已使用自签证书（$SNI）"
       return 0
     fi
+    ask_c "私钥路径$sfx" "" || return 2
+    KEY=$REPLY
+    if [[ ! -f $CERT || ! -f $KEY ]]; then
+      err "证书或私钥文件不存在（留空证书路径可改用自签证书）"
+      continue
+    fi
+    if ! openssl x509 -noout -in "$CERT" >/dev/null 2>&1 || ! openssl pkey -noout -in "$KEY" >/dev/null 2>&1; then
+      err "证书或私钥格式无效（须为标准 PEM 格式）"
+      continue
+    fi
+    INSECURE=0
+    HOST=$SNI
+    return 0
   done
 }
 
 jqw() {
   local t
-  t=$(mktemp "$RUN_TMP"/jq.XXXXXX)
+  t=$(mktemp "$RUN_TMP"/jq.XXXXXX) || return 1
   jq "$@" "$NODES" >"$t" && chmod 600 "$t" && mv "$t" "$NODES"
 }
 snapshot() {
   BAK="$RUN_TMP/nodes.$$.$RANDOM.bak"
   cp "$NODES" "$BAK"
   PENDING_BAK=$BAK
+  CONF_DIRTY=0
 }
 rollback() {
-  cp "$1" "$NODES"
-  chmod 600 "$NODES"
-  PENDING_BAK=""
-  gen_config 2>/dev/null && chmod 600 "$CONF_TMP" && mv "$CONF_TMP" "$CONF"
-  if [[ $(jq length "$NODES") -eq 0 ]]; then
-    svc_ctl stop
-  else
-    svc_ctl restart
-  fi
-  err "$2"
+  _restore_snapshot "$1"
+  [[ -n ${2:-} ]] && err "$2"
 }
 setf() { jqw --argjson i "$1" --arg k "$2" --arg v "$3" '.[$i][$k]=$v'; }
 g() { jq -r --argjson i "$IDX" --arg k "$1" '.[$i][$k] // empty' "$NODES"; }
 
 choose_node() { # 交互选择节点并设置 IDX；取消返回 1
   local n def=""
-  n=$(jq length "$NODES")
-  [[ $n -eq 1 ]] && def=1
+  n=$(node_count)
+  ((n == 1)) && def=1
+  echo
   while :; do
-    ask "编号（0=返回）" "$def"
-    [[ $REPLY == 0 ]] && return 1
+    ask_c "节点编号（0 返回）" "$def" || return 1
     if [[ $REPLY =~ ^[0-9]{1,4}$ ]] && ((10#$REPLY >= 1 && 10#$REPLY <= n)); then
       IDX=$((10#$REPLY - 1))
       return 0
     fi
-    [[ -n $REPLY ]] && err "编号无效（1-$n）"
+    [[ -n $REPLY ]] && err "编号无效，请输入 1-$n"
   done
 }
 
 gen_reality() {
   local out
-  out=$("$XR_BIN" x25519)
-  RPRIV=$(awk -F': ' '/Private/{print $2}' <<<"$out")
-  RPUB=$(awk -F': ' '/PublicKey|Public/{print $2}' <<<"$out")
+  out=$("$XR_BIN" x25519 2>/dev/null) || { err "生成 Reality 密钥失败"; return 1; }
+  RPRIV=$(awk -F': *' '/^Private/{print $2; exit}' <<<"$out" | tr -d '[:space:]')
+  RPUB=$(awk -F': *' '/^(Public ?[Kk]ey|Password):/{print $2; exit}' <<<"$out" | tr -d '[:space:]')
+  [[ -n $RPRIV && -n $RPUB ]] || { err "解析 xray x25519 输出失败"; return 1; }
   RSID=$(openssl rand -hex 4)
 }
 
 gen_uuid() { "$XR_BIN" uuid 2>/dev/null || cat /proc/sys/kernel/random/uuid; }
 
-pick_ss_method() { # 设置 SS_M 和 SS_P
-  printf "${C}1${N}  2022-blake3-aes-128-gcm      ${D}(推荐)${N}\n"
-  printf "${C}2${N}  2022-blake3-aes-256-gcm\n"
-  printf "${C}3${N}  2022-blake3-chacha20-poly1305\n"
-  printf "${C}4${N}  aes-256-gcm\n"
-  printf "${C}5${N}  chacha20-ietf-poly1305\n"
-  ask "加密方式" "1"
-  case $REPLY in
-    2)
-      SS_M=2022-blake3-aes-256-gcm
-      SS_P=$(openssl rand -base64 32)
-      ;;
-    3)
-      SS_M=2022-blake3-chacha20-poly1305
-      SS_P=$(openssl rand -base64 32)
-      ;;
-    4)
-      SS_M=aes-256-gcm
-      SS_P=$(rnd 16)
-      ;;
-    5)
-      SS_M=chacha20-ietf-poly1305
-      SS_P=$(rnd 16)
-      ;;
-    *)
-      SS_M=2022-blake3-aes-128-gcm
-      SS_P=$(openssl rand -base64 16)
-      ;;
-  esac
+pick_vless_tr() { # $1=默认值 $2=提示 -> VLESS_TR；取消返回 2
+  printf "  ${C}1${N}  RAW + Reality (Vision)  ${D}推荐${N}\n"
+  printf "  ${C}2${N}  XHTTP + Reality\n"
+  while :; do
+    ask_c "$2" "$1" || return 2
+    case $REPLY in
+      1 | raw) VLESS_TR=raw; return 0 ;;
+      2 | xhttp) VLESS_TR=xhttp; return 0 ;;
+      *) err "仅支持 1 (RAW) 或 2 (XHTTP)" ;;
+    esac
+  done
 }
 
-# ───────── 添加入站 ─────────
+pick_ss_method() { # $1=1 显示取消提示；设置 SS_M 和 SS_P；取消返回 2
+  local prompt="加密方式"
+  [[ ${1:-0} == 1 ]] && prompt="加密方式（0 取消）"
+  printf "  ${C}1${N}  2022-blake3-aes-128-gcm      ${D}推荐${N}\n"
+  printf "  ${C}2${N}  2022-blake3-aes-256-gcm\n"
+  printf "  ${C}3${N}  2022-blake3-chacha20-poly1305\n"
+  printf "  ${C}4${N}  aes-256-gcm\n"
+  printf "  ${C}5${N}  chacha20-ietf-poly1305\n"
+  while :; do
+    ask_c "$prompt" "1" || return 2
+    case $REPLY in
+      1) SS_M=2022-blake3-aes-128-gcm; SS_P=$(openssl rand -base64 16); return 0 ;;
+      2) SS_M=2022-blake3-aes-256-gcm; SS_P=$(openssl rand -base64 32); return 0 ;;
+      3) SS_M=2022-blake3-chacha20-poly1305; SS_P=$(openssl rand -base64 32); return 0 ;;
+      4) SS_M=aes-256-gcm; SS_P=$(rnd 16); return 0 ;;
+      5) SS_M=chacha20-ietf-poly1305; SS_P=$(rnd 16); return 0 ;;
+      *) err "无效选项，请输入 1-5" ;;
+    esac
+  done
+}
+
+# ───────── 添加节点 ─────────
 add_socks() {
-  ask_port
-  ask "用户名" "u$(rnd 5)"
+  ask_port socks || return $?
+  ask_c "用户名" "u$(rnd 5)" || return 2
   local u=$REPLY
-  ask "密码" "$(rnd 12)"
+  ask_c "密码" "$(rnd 12)" || return 2
   local p=$REPLY
   jqw --argjson port "$PORT" --arg u "$u" --arg p "$p" \
     '. + [{type:"socks",tag:("socks-"+($port|tostring)),port:$port,user:$u,pass:$p}]'
 }
 
 add_ss() {
-  ask_port
-  pick_ss_method
+  ask_port shadowsocks || return $?
+  pick_ss_method || return $?
   jqw --argjson port "$PORT" --arg m "$SS_M" --arg p "$SS_P" \
     '. + [{type:"shadowsocks",tag:("ss-"+($port|tostring)),port:$port,method:$m,password:$p}]'
 }
 
 _add_tls_pw() { # $1=type $2=tag前缀
-  ask_port
-  ask_cert || return 1
-  ask "密码" "$(rnd 16)"
+  ask_port "$1" || return $?
+  ask_cert || return $?
+  ask_c "连接密码" "$(rnd 16)" || return 2
   local p=$REPLY
   jqw --arg t "$1" --arg pfx "$2" --argjson port "$PORT" --arg p "$p" \
     --arg c "$CERT" --arg k "$KEY" --arg sni "$SNI" --arg h "$HOST" --argjson i "$INSECURE" \
@@ -586,38 +664,21 @@ _add_tls_pw() { # $1=type $2=tag前缀
 }
 
 add_vless() {
-  ask_port
-  local tr=raw sni path="" xhost=""
-  printf "${C}1${N}  RAW + Reality (Vision)  ${D}(推荐)${N}\n"
-  printf "${C}2${N}  XHTTP + Reality\n"
-  while :; do
-    ask "传输方式" "1"
-    case $REPLY in
-      1 | raw)
-        tr=raw
-        break
-        ;;
-      2 | xhttp)
-        tr=xhttp
-        break
-        ;;
-      *) err "仅支持 1 (RAW) 或 2 (XHTTP)" ;;
-    esac
-  done
-  ask_sni "Reality 伪装域名" sni
+  ask_port vless || return $?
+  local tr sni path="" xhost=""
+  pick_vless_tr "1" "传输方式" || return 2
+  tr=$VLESS_TR
+  ask_sni "Reality 伪装域名" sni || return $?
   if [[ $tr == xhttp ]]; then
-    ask_path "XHTTP 路径" "/$(rnd 8)" path
+    ask_path "XHTTP 路径" "/$(rnd 8)" path || return $?
     while :; do
-      ask "XHTTP Host（留空=不限制）" ""
+      ask_c "XHTTP Host（留空不限）" "" || return 2
       [[ -z $REPLY ]] && break
-      valid_sni "$REPLY" && {
-        xhost=$REPLY
-        break
-      }
+      valid_sni "$REPLY" && { xhost=$REPLY; break; }
       err "Host 格式无效"
     done
   fi
-  gen_reality
+  gen_reality || return 1
   jqw --argjson port "$PORT" --arg tr "$tr" --arg sni "$sni" --arg path "$path" --arg xhost "$xhost" \
     --arg priv "$RPRIV" --arg pub "$RPUB" --arg sid "$RSID" --arg uuid "$(gen_uuid)" \
     '. + [{type:"vless",tag:("vless-"+($port|tostring)),port:$port,transport:$tr,uuid:$uuid,sni:$sni,priv:$priv,pub:$pub,sid:$sid}
@@ -625,66 +686,86 @@ add_vless() {
 }
 
 add_vmess() {
-  ask_port
-  ask_cert || return 1
+  ask_port vmess || return $?
+  ask_cert || return $?
   local path
-  ask_path "WebSocket 路径" "/$(rnd 8)" path
+  ask_path "WebSocket 路径" "/$(rnd 8)" path || return $?
   jqw --argjson port "$PORT" --arg uuid "$(gen_uuid)" --arg path "$path" \
     --arg c "$CERT" --arg k "$KEY" --arg sni "$SNI" --arg h "$HOST" --argjson i "$INSECURE" \
     '. + [{type:"vmess",tag:("vmess-"+($port|tostring)),port:$port,uuid:$uuid,path:$path,cert:$c,key:$k,sni:$sni,host:$h,insecure:$i}]'
 }
 
 menu_add() {
-  local c
+  local c msg="" rc=0 n ptype
+  local types=(vless hysteria2 trojan vmess shadowsocks socks)
   while :; do
     title "添加节点"
-    printf "${C}1${N}  VLESS          ${C}2${N}  Hysteria2\n"
-    printf "${C}3${N}  Trojan         ${C}4${N}  VMess\n"
-    printf "${C}5${N}  Shadowsocks    ${C}6${N}  SOCKS\n"
-    printf "${C}0${N}  返回\n"
-    read -rp "> " c || return
+    printf "  ${C}1${N}  %-13s ${D}%s${N}\n" "VLESS" "RAW / XHTTP + Reality（推荐）"
+    printf "  ${C}2${N}  %-13s ${D}%s${N}\n" "Hysteria2" "QUIC + TLS（高速抗丢包）"
+    printf "  ${C}3${N}  %-13s ${D}%s${N}\n" "Trojan" "RAW + TLS"
+    printf "  ${C}4${N}  %-13s ${D}%s${N}\n" "VMess" "WebSocket + TLS"
+    printf "  ${C}5${N}  %-13s ${D}%s${N}\n" "Shadowsocks" "SS 2022 / AEAD"
+    printf "  ${C}6${N}  %-13s ${D}%s${N}\n" "SOCKS5" "账号密码认证"
+    echo
+    printf "  ${D}0  返回主菜单${N}\n"
+    if [[ -n $msg ]]; then
+      echo
+      err "$msg"
+      msg=""
+    fi
+    prompt_choice || return
+    c=$REPLY
     [[ -z $c ]] && continue
     [[ $c == 0 ]] && return
     [[ $c =~ ^[1-6]$ ]] && break
-    err "无效选项"
-    sleep 0.6
+    msg="无效选项，请输入 1-6"
   done
-  echo
-  local n
-  n=$(jq length "$NODES")
+
+  ptype=${types[$((c - 1))]}
+  title "添加 $(proto_name "$ptype") 节点"
+  printf "${D}提示：直接回车采用默认值，任意步骤输入 0 可取消${N}\n\n"
+
+  n=$(node_count)
   snapshot
-  case $c in
-    1) add_vless ;;
-    2) _add_tls_pw hysteria2 hy2 ;;
-    3) _add_tls_pw trojan trojan ;;
-    4) add_vmess ;;
-    5) add_ss ;;
-    6) add_socks ;;
+  case $ptype in
+    vless) add_vless || rc=$? ;;
+    hysteria2) _add_tls_pw hysteria2 hy2 || rc=$? ;;
+    trojan) _add_tls_pw trojan trojan || rc=$? ;;
+    vmess) add_vmess || rc=$? ;;
+    shadowsocks) add_ss || rc=$? ;;
+    socks) add_socks || rc=$? ;;
   esac
-  if [[ $(jq length "$NODES") -eq $n ]]; then
+  if ((rc == 2)); then
     PENDING_BAK=""
     return
+  elif ((rc != 0)) || (($(node_count) == n)); then
+    PENDING_BAK=""
+    pause
+    return
   fi
+  echo
   IDX=$n
   if apply; then
     echo
     show_link "$IDX"
-    note "云服务器请在安全组放行端口 $(g port)"
+    echo
+    note "请在防火墙 / 安全组放行端口 ${B}$(g port)/$(l4_label "$(proto_l4 "$ptype")")${N}"
   else
-    rollback "$BAK" "已撤销本次添加"
+    rollback "$BAK" "配置未生效，已撤销本次添加"
   fi
   pause
 }
 
-# ───────── 列表与分享链接 ─────────
+# ───────── 节点列表与分享链接 ─────────
 list_nodes() {
-  local n
-  n=$(jq length "$NODES")
-  [[ $n -eq 0 ]] && {
-    info "暂无节点"
+  (($(node_count) == 0)) && {
+    info "暂无节点，可前往主菜单选择「添加节点」"
     return 1
   }
-  printf "${D}%-6s %-17s %-9s %s${N}\n" "编号" "协议" "端口" "摘要"
+  pad_print "编号" 6 "$D" "$N"
+  pad_print "协议" 14 "$D" "$N"
+  pad_print "端口" 15 "$D" "$N"
+  printf "${D}%s${N}\n%s\n" "配置摘要" "$RULE"
   jq -r 'to_entries[] | [
     (.key+1),
     .value.type,
@@ -692,12 +773,16 @@ list_nodes() {
     (if .value.type == "shadowsocks" then .value.method
      elif .value.type == "vless" then
        (if (.value.transport // "raw") == "xhttp" then ("XHTTP · " + (.value.path // "/")) else ("Reality · " + .value.sni) end)
-     elif .value.type == "trojan" or .value.type == "hysteria2" then ("TLS · " + .value.sni)
+     elif .value.type == "trojan" or .value.type == "hysteria2" then
+       ((if (.value.insecure // 0) == 1 then "自签 TLS · " else "TLS · " end) + .value.sni)
      elif .value.type == "vmess" then ("WS+TLS · " + .value.path)
-     else .value.user end)
+     else ("用户 " + .value.user) end)
   ] | @tsv' "$NODES" \
     | while IFS=$'\t' read -r i t p d; do
-      printf "${C}%-4s${N} %-15s ${B}%-7s${N} ${D}%s${N}\n" "$i" "$t" "$p" "$d"
+      pad_print "$i" 6 "$C" "$N"
+      pad_print "$(proto_name "$t")" 14
+      pad_print "$p/$(l4_label "$(proto_l4 "$t")")" 15 "$B" "$N"
+      printf "${D}%s${N}\n" "$d"
     done
 }
 
@@ -739,37 +824,39 @@ show_link() {
   local name host ptype port meta
   meta=$(jq -r --argjson i "$IDX" '(.[$i] // {}) | [(.tag // ""), (.host // ""), (.type // ""), (.port // "" | tostring)] | join("\u001f")' "$NODES")
   IFS=$'\x1f' read -r name host ptype port <<<"$meta"
-  printf "${C}▸${N} ${B}%s${N}  ${D}%s · %s${N}\n" "$name" "$ptype" "$port"
+  printf "${C}▸${N} ${B}%s${N}  ${D}%s · %s/%s${N}\n" "$name" "$(proto_name "$ptype")" "$port" "$(l4_label "$(proto_l4 "$ptype")")"
   if [[ -n $host ]]; then
     printf "${G}%s${N}\n" "$(build_link "$host")"
     return
   fi
   detect_ips
   if [[ -n $PUBIP4 && -n $PUBIP6 ]]; then
-    printf "${D}IPv4${N}\n${G}%s${N}\n" "$(build_link "$PUBIP4")"
-    printf "${D}IPv6${N}\n${G}%s${N}\n" "$(build_link "$PUBIP6")"
+    printf "${D}IPv4${N}\n${G}%s${N}\n${D}IPv6${N}\n${G}%s${N}\n" "$(build_link "$PUBIP4")" "$(build_link "$PUBIP6")"
   elif [[ -n $PUBIP4 ]]; then
     printf "${G}%s${N}\n" "$(build_link "$PUBIP4")"
   elif [[ -n $PUBIP6 ]]; then
     printf "${G}%s${N}\n" "$(build_link "$PUBIP6")"
   else
+    warn "未检测到公网 IP，以下链接中的 YOUR_IP 请手动替换为服务器地址"
     printf "${G}%s${N}\n" "$(build_link "YOUR_IP")"
   fi
 }
 
 menu_links() {
   title "分享链接"
-  list_nodes || {
-    sleep 1
-    return
-  }
   local n i
-  n=$(jq length "$NODES")
+  n=$(node_count)
+  if ((n == 1)); then
+    show_link 0
+    pause
+    return
+  fi
+  list_nodes || { pause; return; }
+  echo
   while :; do
-    ask "编号（a=全部，0=返回）" "a"
-    [[ $REPLY == 0 ]] && return
-    if [[ $REPLY == a ]]; then
-      echo
+    ask_c "节点编号（a 全部，0 返回）" "a" || return
+    if [[ $REPLY =~ ^[Aa]$ ]]; then
+      title "分享链接 · 全部节点"
       for ((i = 0; i < n; i++)); do
         show_link "$i"
         ((i < n - 1)) && echo
@@ -777,11 +864,11 @@ menu_links() {
       break
     fi
     if [[ $REPLY =~ ^[0-9]{1,4}$ ]] && ((10#$REPLY >= 1 && 10#$REPLY <= n)); then
-      echo
+      title "分享链接"
       show_link "$((10#$REPLY - 1))"
       break
     fi
-    err "编号无效（1-$n 或 a）"
+    err "输入无效，请输入 1-$n、a 或 0"
   done
   pause
 }
@@ -789,304 +876,322 @@ menu_links() {
 # ───────── 编辑节点 ─────────
 node_fields() {
   case $(g type) in
-    socks) FIELDS=("port:端口" "user:用户名" "pass:密码") ;;
-    shadowsocks) FIELDS=("port:端口" "method:加密方式" "password:密码") ;;
-    trojan | hysteria2) FIELDS=("port:端口" "password:密码" "sni:SNI" "_cert:更换证书") ;;
+    socks) FIELDS=("port:监听端口" "user:用户名" "pass:密码") ;;
+    shadowsocks) FIELDS=("port:监听端口" "method:加密方式" "password:密码") ;;
+    trojan | hysteria2) FIELDS=("port:监听端口" "password:连接密码" "sni:域名 / SNI" "_cert:更换证书") ;;
     vless)
-      FIELDS=("port:端口" "transport:传输方式" "sni:伪装域名")
+      FIELDS=("port:监听端口" "transport:传输方式" "sni:伪装域名")
       [[ $(g transport) == xhttp ]] && FIELDS+=("path:XHTTP 路径" "xhost:XHTTP Host")
-      FIELDS+=("uuid:UUID" "sid:ShortID" "_reality:重置 Reality")
+      FIELDS+=("uuid:UUID" "sid:ShortID" "_reality:重置 Reality 密钥")
       ;;
-    vmess) FIELDS=("port:端口" "uuid:UUID" "path:WS 路径" "sni:SNI" "_cert:更换证书") ;;
+    vmess) FIELDS=("port:监听端口" "uuid:UUID" "path:WebSocket 路径" "sni:域名 / SNI" "_cert:更换证书") ;;
   esac
 }
 
-_ask_match() { # $1=提示 $2=默认 $3=原值 $4=正则 $5=错误提示
+_ask_match() { # $1=提示 $2=默认 $3=正则 $4=错误提示
   while :; do
-    ask "$1（0=取消）" "$2"
-    [[ $REPLY == 0 || $REPLY == "$3" ]] && return 1
-    [[ $REPLY =~ $4 ]] && return 0
-    err "$5"
+    ask_c "$1（0 取消）" "$2" || return 1
+    [[ $REPLY == "$2" ]] && return 1
+    [[ $REPLY =~ $3 ]] && return 0
+    err "$4"
   done
 }
 
 edit_field() {
-  local k=$1 cur np
+  local k=$1 cur np l4 ptype
+  EDIT_NOTICE=""
   cur=$(g "$k")
+  ptype=$(g type)
   case $k in
     port)
+      l4=$(proto_l4 "$ptype")
       while :; do
-        ask "新端口（0=取消）" "$cur"
-        [[ $REPLY == 0 || $REPLY == "$cur" ]] && return 1
-        valid_port "$REPLY" || {
-          err "端口无效 (1-65535)"
-          continue
-        }
+        ask_c "新端口（0 取消）" "$cur" || return 1
+        [[ $REPLY == "$cur" ]] && return 1
+        valid_port "$REPLY" || { err "端口无效，请输入 1-65535 之间的整数"; continue; }
         np=$((10#$REPLY))
-        port_free "$np" && break
-        err "端口已被占用"
+        port_free "$np" "$l4" && break
+        err "端口 $np 已被占用"
       done
-      local tag
-      tag=$(g tag | sed "s/-$cur\$/-$np/")
-      jqw --argjson i "$IDX" --arg t "$tag" --argjson p "$np" '.[$i].tag=$t | .[$i].port=$p'
+      jqw --argjson i "$IDX" --arg t "$(g tag | sed "s/-$cur\$/-$np/")" --argjson p "$np" '.[$i].tag=$t | .[$i].port=$p'
+      EDIT_NOTICE="端口已更新为 $np"
       ;;
     method)
-      pick_ss_method
+      pick_ss_method 1 || return 1
       jqw --argjson i "$IDX" --arg m "$SS_M" --arg p "$SS_P" '.[$i].method=$m | .[$i].password=$p'
-      note "已按新加密方式重新生成密码"
-      sleep 0.8
+      EDIT_NOTICE="加密方式已切换为 $SS_M，密码已同步重新生成"
       ;;
     password)
+      local ssm=""
+      [[ $ptype == shadowsocks ]] && ssm=$(g method)
       while :; do
-        ask "新密码（0=取消）" "$cur"
-        [[ $REPLY == 0 || $REPLY == "$cur" ]] && return 1
-        [[ -n $REPLY ]] || {
-          err "不能为空"
-          continue
-        }
-        if [[ $(g type) == shadowsocks && $(g method) == 2022-blake3-* ]]; then
-          valid_ss2022_psk "$(g method)" "$REPLY" || {
-            err "SS 2022 密码须为对应长度（16/32 字节）的 Base64"
-            continue
-          }
+        ask_c "新密码（0 取消）" "$cur" || return 1
+        [[ $REPLY == "$cur" ]] && return 1
+        [[ -n $REPLY ]] || { err "密码不能为空"; continue; }
+        if [[ $ssm == 2022-blake3-* ]]; then
+          valid_ss2022_psk "$ssm" "$REPLY" || { err "SS 2022 密码须为对应长度（16 或 32 字节）的标准 Base64"; continue; }
         fi
         break
       done
       setf "$IDX" password "$REPLY"
+      EDIT_NOTICE="密码已更新"
       ;;
     transport)
-      local nt
-      printf "${C}1${N}  RAW (Vision)\n${C}2${N}  XHTTP\n"
-      while :; do
-        ask "传输方式（0=取消）" "${cur:-raw}"
-        [[ $REPLY == 0 ]] && return 1
-        case $REPLY in
-          1 | raw)
-            nt=raw
-            break
-            ;;
-          2 | xhttp)
-            nt=xhttp
-            break
-            ;;
-          *) err "仅支持 1 (RAW) 或 2 (XHTTP)" ;;
-        esac
-      done
-      [[ $nt == "${cur:-raw}" ]] && return 1
-      if [[ $nt == xhttp ]]; then
+      pick_vless_tr "${cur:-raw}" "传输方式（0 取消）" || return 1
+      [[ $VLESS_TR == "${cur:-raw}" ]] && return 1
+      if [[ $VLESS_TR == xhttp ]]; then
         local np_path
         np_path=$(g path)
-        [[ -n $np_path ]] || np_path="/$(rnd 8)"
-        jqw --argjson i "$IDX" --arg p "$np_path" '.[$i].transport="xhttp" | .[$i].path=$p'
+        jqw --argjson i "$IDX" --arg p "${np_path:-/$(rnd 8)}" '.[$i].transport="xhttp" | .[$i].path=$p'
+        EDIT_NOTICE="传输方式已切换为 XHTTP"
       else
         jqw --argjson i "$IDX" '.[$i].transport="raw" | del(.[$i].path, .[$i].xhost)'
+        EDIT_NOTICE="传输方式已切换为 RAW (Vision)"
       fi
       ;;
     sni)
       while :; do
-        ask "新伪装域名（0=取消）" "$cur"
-        [[ $REPLY == 0 || $REPLY == "$cur" ]] && return 1
+        ask_c "新域名 / SNI（0 取消）" "$cur" || return 1
+        [[ $REPLY == "$cur" ]] && return 1
         valid_sni "$REPLY" && break
-        err "域名 / SNI 格式无效"
+        err "域名 / SNI 格式无效（仅支持字母、数字、点与连字符）"
       done
-      if [[ $(g insecure) == 0 && -n $(g host) ]]; then
-        jqw --argjson i "$IDX" --arg s "$REPLY" '.[$i].sni=$s | .[$i].host=$s'
-        note "已同步更新链接域名，请确保证书匹配新域名"
-        sleep 0.8
+      local new_sni=$REPLY insec
+      insec=$(g insecure)
+      if [[ $insec == 1 ]]; then
+        gen_self_cert "$new_sni" || { pause; return 1; }
+        jqw --argjson i "$IDX" --arg s "$new_sni" --arg c "$CERT" --arg k "$KEY" '.[$i].sni=$s | .[$i].cert=$c | .[$i].key=$k'
+        EDIT_NOTICE="SNI 已更新，并已同步生成对应自签证书"
+      elif [[ $insec == 0 && -n $(g host) ]]; then
+        jqw --argjson i "$IDX" --arg s "$new_sni" '.[$i].sni=$s | .[$i].host=$s'
+        EDIT_NOTICE="SNI 与分享域名已同步更新，请确保证书匹配新域名"
       else
-        setf "$IDX" sni "$REPLY"
+        setf "$IDX" sni "$new_sni"
+        EDIT_NOTICE="SNI 已更新为 $new_sni"
       fi
       ;;
-    pass)
-      _ask_match "新密码" "$cur" "$cur" '.+' "不能为空" || return 1
-      setf "$IDX" pass "$REPLY"
-      ;;
     path)
-      _ask_match "新路径" "$cur" "$cur" '^/[^[:space:]]*$' "路径须以 / 开头且不含空格" || return 1
+      while :; do
+        ask_c "新路径（0 取消）" "$cur" || return 1
+        [[ $REPLY == "$cur" ]] && return 1
+        valid_path "$REPLY" && break
+        err "路径须以 / 开头且不能包含空白字符"
+      done
       setf "$IDX" path "$REPLY"
+      EDIT_NOTICE="路径已更新为 $REPLY"
       ;;
     xhost)
       while :; do
-        ask "新 XHTTP Host（-=清空，0=取消）" "$cur"
-        [[ $REPLY == 0 || $REPLY == "$cur" ]] && return 1
+        ask_c "新 XHTTP Host（输入 - 清空，0 取消）" "$cur" || return 1
+        [[ $REPLY == "$cur" ]] && return 1
         if [[ $REPLY == - ]]; then
           jqw --argjson i "$IDX" 'del(.[$i].xhost)'
+          EDIT_NOTICE="已清空 XHTTP Host 限制"
           return 0
         fi
         valid_sni "$REPLY" && break
         err "Host 格式无效"
       done
       setf "$IDX" xhost "$REPLY"
+      EDIT_NOTICE="XHTTP Host 已更新为 $REPLY"
       ;;
     uuid)
-      _ask_match "新 UUID" "$cur" "$cur" \
-        '^[0-9a-fA-F]{8}(-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}$' "UUID 格式无效" || return 1
+      _ask_match "新 UUID" "$cur" '^[0-9a-fA-F]{8}(-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}$' "UUID 格式无效" || return 1
       setf "$IDX" uuid "$REPLY"
+      EDIT_NOTICE="UUID 已更新"
       ;;
     sid)
-      _ask_match "新 ShortID（偶数位十六进制，最长 16 位）" "$cur" "$cur" \
-        '^([0-9a-fA-F]{2}){1,8}$' "ShortID 格式无效" || return 1
+      _ask_match "新 ShortID（偶数位十六进制，最长 16 位）" "$cur" '^([0-9a-fA-F]{2}){1,8}$' "ShortID 格式无效" || return 1
       setf "$IDX" sid "$REPLY"
+      EDIT_NOTICE="ShortID 已更新"
       ;;
     _cert)
-      ask_cert || {
-        sleep 0.8
-        return 1
-      }
+      local rc=0
+      ask_cert 1 || rc=$?
+      ((rc == 0)) || { ((rc != 2)) && pause; return 1; }
       jqw --argjson i "$IDX" --arg c "$CERT" --arg k "$KEY" --arg sni "$SNI" --arg h "$HOST" --argjson in "$INSECURE" \
         '.[$i] += {cert:$c,key:$k,sni:$sni,host:$h,insecure:$in}'
+      EDIT_NOTICE="证书配置已更新"
       ;;
     _reality)
-      gen_reality
+      gen_reality || { pause; return 1; }
       jqw --argjson i "$IDX" --arg priv "$RPRIV" --arg pub "$RPUB" --arg sid "$RSID" \
         '.[$i] += {priv:$priv,pub:$pub,sid:$sid}'
-      ok "已生成新的密钥对"
-      sleep 0.8
+      EDIT_NOTICE="已重新生成 Reality 密钥对与 ShortID"
       ;;
     *)
-      _ask_match "新值" "$cur" "$cur" '.+' "不能为空" || return 1
+      local lbl="新值"
+      [[ $k == pass ]] && lbl="新密码"
+      [[ $k == user ]] && lbl="新用户名"
+      _ask_match "$lbl" "$cur" '.+' "输入不能为空" || return 1
       setf "$IDX" "$k" "$REPLY"
+      EDIT_NOTICE="${lbl#新}已更新"
       ;;
   esac
 }
 
 menu_edit() {
   title "编辑节点"
-  list_nodes || {
-    sleep 1
-    return
-  }
+  list_nodes || { pause; return; }
   choose_node || return
-  local dirty=0 i f k v
+  local dirty=0 i f k v c notice="" err_msg="" tag_title
   snapshot
   while :; do
-    title "$(g tag)"
+    tag_title="编辑节点 · $(g tag)"
+    ((dirty)) && tag_title+=" ${Y}*${N}"
+    title "$tag_title"
     node_fields
     i=1
     for f in "${FIELDS[@]}"; do
       k=${f%%:*}
-      local label ascii_part w pad
-      label=${f#*:}
-      if [[ $k == _* ]]; then
-        v=""
-      else
-        v=$(g "$k")
-        [[ -z $v ]] && v="—"
-      fi
-      ascii_part=${label//[^ -~]/}
-      w=$((${#label} * 2 - ${#ascii_part}))
-      pad=$((16 - w))
-      ((pad < 1)) && pad=1
-      printf "${C}%-2s${N} %s%*s${D}%s${N}\n" "$i" "$label" "$pad" "" "$v"
+      v=""
+      [[ $k == _* ]] || { v=$(g "$k"); [[ -n $v ]] || v="—"; }
+      printf "  ${C}%-2s${N} " "$i"
+      pad_print "${f#*:}" 20
+      printf "${D}%s${N}\n" "$v"
       ((i++))
     done
-    printf "${C}0${N}  保存并返回\n"
-    read -rp "> " c || {
-      if [[ $dirty == 1 ]]; then
-        rollback "$BAK" "已取消修改"
+    echo
+    if ((dirty)); then
+      printf "  ${G}s${N}  保存并应用    ${D}0  放弃修改并返回${N}\n"
+    else
+      printf "  ${D}0  返回主菜单${N}\n"
+    fi
+    if [[ -n $notice ]]; then
+      echo
+      note "$notice"
+      notice=""
+    elif [[ -n $err_msg ]]; then
+      echo
+      err "$err_msg"
+      err_msg=""
+    fi
+    prompt_choice || {
+      ((dirty)) && rollback "$BAK" "已取消修改" || PENDING_BAK=""
+      return
+    }
+    c=$REPLY
+    [[ -z $c ]] && continue
+    if [[ $c == 0 ]]; then
+      if ((dirty)); then
+        confirm "当前有未保存的修改，确认放弃？" || continue
+        rollback "$BAK" ""
       else
         PENDING_BAK=""
       fi
       return
-    }
-    [[ -z $c ]] && continue
-    [[ $c == 0 ]] && break
+    fi
+    ((dirty)) && [[ $c =~ ^[Ss]$ ]] && break
     if [[ $c =~ ^[0-9]{1,2}$ ]] && ((10#$c >= 1 && 10#$c <= ${#FIELDS[@]})); then
       echo
-      edit_field "${FIELDS[$((10#$c - 1))]%%:*}" && dirty=1
+      if edit_field "${FIELDS[$((10#$c - 1))]%%:*}"; then
+        dirty=1
+        notice=$EDIT_NOTICE
+      fi
+    else
+      err_msg="无效选项，请输入 1-${#FIELDS[@]}"
     fi
   done
-  if [[ $dirty == 1 ]]; then
+  echo
+  if apply; then
     echo
-    if apply; then
-      echo
-      show_link "$IDX"
-    else
-      rollback "$BAK" "配置无效，已回滚修改"
-    fi
-    pause
+    show_link "$IDX"
   else
-    PENDING_BAK=""
+    rollback "$BAK" "配置校验或启动失败，已回滚全部修改"
   fi
+  pause
 }
 
-# ───────── 删除 / 服务 / 日志 / 卸载 ─────────
+# ───────── 删除节点 / 服务管理 / 日志 / 卸载 ─────────
 menu_del() {
   title "删除节点"
-  list_nodes || {
-    sleep 1
-    return
-  }
+  list_nodes || { pause; return; }
   choose_node || return
-  local port
-  port=$(g port)
-  confirm "确认删除 $(g type):$port ?" || return
+  local tag
+  tag=$(g tag)
+  echo
+  confirm "确认删除节点 ${B}$tag${N}（$(proto_name "$(g type)") · 端口 $(g port)）？" || return
   snapshot
   jqw --argjson i "$IDX" 'del(.[$i])'
+  echo
   if apply; then
-    ok "已删除"
+    ok "节点 $tag 已删除"
   else
     rollback "$BAK" "配置应用失败，已撤销删除"
   fi
-  sleep 0.8
+  pause
 }
 
 menu_service() {
-  local c auto
+  local c auto toast_fn="" toast_msg=""
   while :; do
     title "服务管理"
-    auto="${D}[已关闭]${N}"
-    svc_ctl is-enabled && auto="${G}[已开启]${N}"
-    printf "${C}1${N}  启动 / 重启\n${C}2${N}  停止服务\n${C}3${N}  开机自启  %s\n${C}0${N}  返回\n" "$auto"
-    read -rp "> " c || return
+    auto="${D}已关闭${N}"
+    svc_ctl is-enabled && auto="${G}已开启${N}"
+    printf "  ${C}1${N}  启动 / 重启服务\n"
+    printf "  ${C}2${N}  停止服务\n"
+    printf "  ${C}3${N}  开机自启  ${D}[${N}%s${D}]${N}\n\n" "$auto"
+    printf "  ${D}0  返回主菜单${N}\n"
+    if [[ -n $toast_msg ]]; then
+      echo
+      "$toast_fn" "$toast_msg"
+      toast_fn=""
+      toast_msg=""
+    fi
+    prompt_choice || return
+    c=$REPLY
     [[ -z $c ]] && continue
     [[ $c == 0 ]] && return
     case $c in
-      1) apply ;;
+      1)
+        echo
+        if apply; then
+          toast_fn=ok
+          toast_msg="服务已重新加载并运行正常"
+        else
+          pause
+        fi
+        ;;
       2)
         svc_ctl stop
-        ok "服务已停止"
+        toast_fn=ok
+        toast_msg="服务已停止"
         ;;
       3)
         if svc_ctl is-enabled; then
           svc_ctl disable
-          ok "已关闭开机自启"
+          toast_fn=ok
+          toast_msg="已关闭开机自启"
         else
           svc_ctl enable
-          ok "已开启开机自启"
+          toast_fn=ok
+          toast_msg="已开启开机自启"
         fi
         ;;
       *)
-        err "无效选项"
-        sleep 0.8
-        continue
+        toast_fn=err
+        toast_msg="无效选项，请输入 1-3"
         ;;
     esac
-    sleep 0.8
-    return
   done
 }
 
 uninstall() {
   title "${R}彻底卸载${N}"
-  local n=0 svc_file="/etc/init.d/xray"
-  [[ -f $NODES ]] && n=$(jq length "$NODES" 2>/dev/null || echo 0)
+  local n svc_file="/etc/init.d/xray"
+  n=$(node_count)
   [[ $OS == debian ]] && svc_file="/etc/systemd/system/xray.service"
-  warn "此操作将彻底清除 Xray-core 及其全部数据，不可恢复"
-  ((n > 0)) && warn "当前仍有 $n 个节点配置，卸载后将全部丢失"
+  warn "此操作将彻底清除 Xray-core 及其全部数据，且不可恢复"
+  ((n > 0)) && warn "当前仍有 $n 个节点配置，卸载后将一并删除"
   echo
-  printf "${D}将删除以下内容：${N}\n"
-  printf "${D}-${N} 内核文件  %s\n" "$XR_BIN"
-  printf "${D}-${N} 快捷命令  /usr/local/bin/xr\n"
-  printf "${D}-${N} 配置目录  %s（含节点与证书）\n" "$XR_DIR"
-  printf "${D}-${N} 服务配置  %s\n" "$svc_file"
-  [[ $OS == alpine ]] && printf "${D}-${N} 运行日志  %s\n" "$XR_LOG"
+  printf "${D}即将移除以下内容：${N}\n"
+  printf "  ${D}·${N} 内核文件  %s\n" "$XR_BIN"
+  printf "  ${D}·${N} 快捷命令  /usr/local/bin/xr\n"
+  printf "  ${D}·${N} 配置目录  %s（含节点与证书）\n" "$XR_DIR"
+  printf "  ${D}·${N} 服务文件  %s\n" "$svc_file"
+  [[ $OS == alpine ]] && printf "  ${D}·${N} 运行日志  %s\n" "$XR_LOG"
   echo
-  if ! confirm "确认彻底卸载？"; then
-    info "已取消卸载"
-    sleep 0.6
-    return
-  fi
+  confirm "确认彻底卸载 Xray-core？" || return
   echo
   info "正在停止服务并清理文件…"
   svc_ctl stop
@@ -1103,53 +1208,59 @@ uninstall() {
 header() {
   clear
   if xr_installed; then
-    local st n=0 v
-    [[ -f $NODES ]] && n=$(jq length "$NODES" 2>/dev/null || echo 0)
-    if svc_ctl is-active; then
-      st="${G}● 运行中${N}"
-    else st="${D}○ 已停止${N}"; fi
+    local st="${D}○ 已停止${N}" v
+    svc_ctl is-active && st="${G}● 运行中${N}"
     v=$(xr_version)
-    printf "${B}Xray-core${N}  %s  ${D}v%s · %s 节点${N}\n" "$st" "${v:-?}" "$n"
+    printf "${B}Xray-core${N}   %s   ${D}v%s · %s 个节点${N}\n" "$st" "${v:-?}" "$(node_count)"
   else
-    printf "${B}Xray-core${N}\n"
+    printf "${B}Xray-core${N}   ${D}未安装${N}\n"
   fi
+  printf '%s\n' "$RULE"
 }
 
 main_menu() {
+  local c msg="" urc
   while :; do
     header
-    printf "${C}1${N}  节点列表       ${C}6${N}  服务管理\n"
-    printf "${C}2${N}  添加节点       ${C}7${N}  运行日志\n"
-    printf "${C}3${N}  编辑节点       ${C}8${N}  更新内核\n"
-    printf "${C}4${N}  删除节点       ${C}9${N}  彻底卸载\n"
-    printf "${C}5${N}  分享链接       ${C}0${N}  退出\n"
-    read -rp "> " c || exit 0
+    printf "  "
+    pad_print "节点管理" 22 "$D" "$N"
+    printf "${D}%s${N}\n" "系统维护"
+    printf "  ${C}1${N}  "; pad_print "查看节点" 19; printf "${C}6${N}  服务管理\n"
+    printf "  ${C}2${N}  "; pad_print "添加节点" 19; printf "${C}7${N}  运行日志\n"
+    printf "  ${C}3${N}  "; pad_print "编辑节点" 19; printf "${C}8${N}  更新内核\n"
+    printf "  ${C}4${N}  "; pad_print "删除节点" 19; printf "${R}9${N}  彻底卸载\n"
+    printf "  ${C}5${N}  "; pad_print "分享链接" 19; printf "${D}0  退出面板${N}\n"
+    if [[ -n $msg ]]; then
+      echo
+      err "$msg"
+      msg=""
+    fi
+    prompt_choice || exit 0
+    c=$REPLY
     case $c in
-      1)
-        title "节点列表"
-        list_nodes
-        pause
-        ;;
+      "") continue ;;
+      1) title "节点列表"; list_nodes; pause ;;
       2) menu_add ;;
       3) menu_edit ;;
       4) menu_del ;;
       5) menu_links ;;
       6) menu_service ;;
-      7)
-        title "运行日志"
-        svc_logs
-        pause
-        ;;
+      7) title "运行日志"; svc_logs; pause ;;
       8)
         title "更新内核"
-        install_xray && apply
-        sleep 1
+        urc=0
+        install_xray || urc=$?
+        if ((urc == 0)); then
+          echo
+          apply
+          pause
+        elif ((urc == 1)); then
+          pause
+        fi
         ;;
       9) uninstall ;;
-      0)
-        clear
-        exit 0
-        ;;
+      0) clear; exit 0 ;;
+      *) msg="无效选项，请输入 0-9" ;;
     esac
   done
 }
@@ -1158,18 +1269,30 @@ main_menu() {
 ensure_deps
 if ! xr_installed; then
   header
-  info "未检测到 Xray-core"
-  confirm "是否安装？" || exit 0
+  info "尚未安装 Xray-core"
+  echo
+  confirm "是否立即下载并安装？" || exit 0
+  echo
   install_xray || exit 1
-  sleep 0.8
+  sleep 0.6
 fi
 init_dirs
-if [[ -f $0 && $(readlink -f "$0") != /usr/local/bin/xr ]]; then
-  install -m755 "$0" /usr/local/bin/xr 2>/dev/null
-elif [[ ! -f $0 && ! -x /usr/local/bin/xr && -n $SCRIPT_URL ]]; then
-  if confirm "是否安装快捷命令 xr（来源：$SCRIPT_URL）？"; then
-    curl -fsSL "$SCRIPT_URL" -o /usr/local/bin/xr 2>/dev/null && chmod 755 /usr/local/bin/xr
+if [[ ! -x /usr/local/bin/xr ]]; then
+  if [[ -f $0 && $(readlink -f "$0") != /usr/local/bin/xr ]]; then
+    install -m755 "$0" /usr/local/bin/xr 2>/dev/null && {
+      note "已创建快捷命令 xr，后续可直接输入 xr 启动面板"
+      sleep 0.8
+    }
+  elif [[ ! -f $0 && -n $SCRIPT_URL ]]; then
+    echo
+    if confirm "是否安装快捷命令 xr（便于后续一键启动）？"; then
+      if curl -fsSL "$SCRIPT_URL" -o "$RUN_TMP/xr.sh" 2>/dev/null && head -n 1 "$RUN_TMP/xr.sh" | grep -q '^#!'; then
+        install -m755 "$RUN_TMP/xr.sh" /usr/local/bin/xr 2>/dev/null && ok "快捷命令 xr 已安装"
+      else
+        err "快捷命令下载失败"
+      fi
+      sleep 0.8
+    fi
   fi
 fi
 main_menu
-
