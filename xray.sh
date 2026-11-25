@@ -35,7 +35,7 @@ ok() { printf "${G}[正确]${N} %s\n" "$*"; }
 err() { printf "${R}[错误]${N} %s\n" "$*"; }
 pause() {
   echo
-  read -rsp "  按回车返回…" _
+  read -rsp "按回车返回…" _
   echo
 }
 title() {
@@ -45,38 +45,47 @@ title() {
 
 ask() { # $1=提示 $2=默认 -> REPLY
   if [[ -n $2 ]]; then
-    read -rp "  $1 [$2]: " REPLY
+    read -rp "$1 [$2]: " REPLY
     REPLY=${REPLY:-$2}
   else
-    read -rp "  $1: " REPLY
+    read -rp "$1: " REPLY
   fi
 }
 
 confirm() {
-  read -rp "  $1 [y/N]: " REPLY
+  read -rp "$1 [y/N]: " REPLY
   [[ $REPLY =~ ^[Yy]$ ]]
 }
 
 RUN_TMP=$(mktemp -d -t xr-panel.XXXXXX)
 CONF_TMP="$RUN_TMP/config.json"
-cleanup() { [[ -n $RUN_TMP ]] && rm -rf "$RUN_TMP"; }
+PENDING_BAK=""
+cleanup() {
+  if [[ -n ${PENDING_BAK:-} && -f $PENDING_BAK && -n ${NODES:-} ]]; then
+    cp "$PENDING_BAK" "$NODES" 2>/dev/null || true
+    chmod 600 "$NODES" 2>/dev/null || true
+    PENDING_BAK=""
+  fi
+  [[ -n $RUN_TMP ]] && rm -rf "$RUN_TMP"
+}
 trap cleanup EXIT
 trap 'cleanup; echo; exit 130' INT TERM
 
 # ───────── 基础环境与服务 ─────────
 ensure_deps() {
-  local pk=() c
+  local pk=() c log="$RUN_TMP/deps.log"
   for c in curl jq openssl unzip ss; do
     command -v "$c" >/dev/null && continue
     [[ $c == ss ]] && pk+=(iproute2) || pk+=("$c")
   done
   [[ ${#pk[@]} -eq 0 ]] && return 0
   if [[ $OS == debian ]]; then
-    apt-get update -qq >/dev/null 2>&1 && apt-get install -y -qq "${pk[@]}" ca-certificates >/dev/null 2>&1
+    apt-get update -qq >"$log" 2>&1 && apt-get install -y -qq "${pk[@]}" ca-certificates >>"$log" 2>&1
   else
-    apk add --no-cache "${pk[@]}" ca-certificates >/dev/null 2>&1
+    apk add --no-cache "${pk[@]}" ca-certificates >"$log" 2>&1
   fi || {
     err "依赖安装失败"
+    tail -n 20 "$log" 2>/dev/null
     exit 1
   }
 }
@@ -113,6 +122,18 @@ depend() {
 }
 EOF
     chmod 755 /etc/init.d/xray
+    if [[ -d /etc/logrotate.d ]]; then
+      cat >/etc/logrotate.d/xray <<EOF
+$XR_LOG {
+  weekly
+  rotate 4
+  compress
+  missingok
+  notifempty
+  copytruncate
+}
+EOF
+    fi
   fi
 }
 
@@ -223,22 +244,24 @@ install_xray() {
 
 # ───────── 配置生成（严格遵循 Xray-core 官方文档标准）─────────
 gen_config() {
-  jq '{
+  local listen_ip="::"
+  [[ -f /proc/net/if_inet6 ]] || listen_ip="0.0.0.0"
+  jq --arg l "$listen_ip" '{
     log: {loglevel: "warning"},
     inbounds: map(
       if .type == "socks" then
         {
-          tag: .tag, listen: "::", port: .port, protocol: "socks",
+          tag: .tag, listen: $l, port: .port, protocol: "socks",
           settings: {auth: "password", users: [{user: .user, pass: .pass}], udp: true}
         }
       elif .type == "shadowsocks" then
         {
-          tag: .tag, listen: "::", port: .port, protocol: "shadowsocks",
+          tag: .tag, listen: $l, port: .port, protocol: "shadowsocks",
           settings: {network: "tcp,udp", method: .method, password: .password}
         }
       elif .type == "trojan" then
         {
-          tag: .tag, listen: "::", port: .port, protocol: "trojan",
+          tag: .tag, listen: $l, port: .port, protocol: "trojan",
           settings: {users: [{password: .password}]},
           streamSettings: {
             network: "raw", security: "tls",
@@ -247,7 +270,7 @@ gen_config() {
         }
       elif .type == "vless" then
         {
-          tag: .tag, listen: "::", port: .port, protocol: "vless",
+          tag: .tag, listen: $l, port: .port, protocol: "vless",
           settings: {
             users: [(if (.transport // "raw") == "xhttp" then {id: .uuid} else {id: .uuid, flow: "xtls-rprx-vision"} end)],
             decryption: "none"
@@ -265,7 +288,7 @@ gen_config() {
         }
       elif .type == "vmess" then
         {
-          tag: .tag, listen: "::", port: .port, protocol: "vmess",
+          tag: .tag, listen: $l, port: .port, protocol: "vmess",
           settings: {users: [{id: .uuid}]},
           streamSettings: {
             network: "ws",
@@ -276,7 +299,7 @@ gen_config() {
         }
       elif .type == "hysteria2" then
         {
-          tag: .tag, listen: "::", port: .port, protocol: "hysteria",
+          tag: .tag, listen: $l, port: .port, protocol: "hysteria",
           settings: {version: 2, users: [{auth: .password}]},
           streamSettings: {
             network: "hysteria",
@@ -308,6 +331,7 @@ apply() {
   fi
   if [[ $(jq length "$NODES") -eq 0 ]]; then
     svc_ctl stop
+    PENDING_BAK=""
     ok "节点已清空，服务已停止"
     return 0
   fi
@@ -317,6 +341,7 @@ apply() {
   for i in 1 2 3 4 5 6; do
     sleep 0.5
     svc_ctl is-active && {
+      PENDING_BAK=""
       ok "配置已生效"
       return 0
     }
@@ -387,7 +412,8 @@ ask_path() { # $1=提示 $2=默认值 $3=变量名
 ask_cert() {
   ask_sni "域名 / SNI" SNI
   while :; do
-    ask "证书路径（留空=自签）" ""
+    ask "证书路径（留空=自签，0=取消）" ""
+    [[ $REPLY == 0 ]] && return 1
     CERT=$REPLY
     if [[ -z $CERT ]]; then
       CERT=$CERT_DIR/$SNI.crt
@@ -409,14 +435,20 @@ ask_cert() {
       HOST=""
       return 0
     else
-      ask "私钥路径" ""
+      ask "私钥路径（0=取消）" ""
+      [[ $REPLY == 0 ]] && return 1
       KEY=$REPLY
-      [[ -f $CERT && -f $KEY ]] && {
-        INSECURE=0
-        HOST=$SNI
-        return 0
-      }
-      err "证书或私钥文件不存在（留空证书路径可改用自签）"
+      if [[ ! -f $CERT || ! -f $KEY ]]; then
+        err "证书或私钥文件不存在（留空证书路径可改用自签）"
+        continue
+      fi
+      if ! openssl x509 -noout -in "$CERT" >/dev/null 2>&1 || ! openssl pkey -noout -in "$KEY" >/dev/null 2>&1; then
+        err "证书或私钥格式无效（需为 PEM 格式）"
+        continue
+      fi
+      INSECURE=0
+      HOST=$SNI
+      return 0
     fi
   done
 }
@@ -429,12 +461,18 @@ jqw() {
 snapshot() {
   BAK="$RUN_TMP/nodes.$$.$RANDOM.bak"
   cp "$NODES" "$BAK"
+  PENDING_BAK=$BAK
 }
 rollback() {
   cp "$1" "$NODES"
   chmod 600 "$NODES"
+  PENDING_BAK=""
   gen_config 2>/dev/null && chmod 600 "$CONF_TMP" && mv "$CONF_TMP" "$CONF"
-  svc_ctl restart
+  if [[ $(jq length "$NODES") -eq 0 ]]; then
+    svc_ctl stop
+  else
+    svc_ctl restart
+  fi
   err "$2"
 }
 setf() { jqw --argjson i "$1" --arg k "$2" --arg v "$3" '.[$i][$k]=$v'; }
@@ -590,6 +628,7 @@ menu_add() {
     6) add_socks ;;
   esac
   if [[ $(jq length "$NODES") -eq $n ]]; then
+    PENDING_BAK=""
     return
   fi
   IDX=$n
@@ -611,7 +650,7 @@ list_nodes() {
     info "暂无节点"
     return 1
   }
-  printf "  ${D}%-4s %-15s %-7s %s${N}\n" "编号" "协议" "端口" "摘要"
+  printf "${D}%-4s %-15s %-7s %s${N}\n" "编号" "协议" "端口" "摘要"
   jq -r 'to_entries[] | [
     (.key+1),
     .value.type,
@@ -624,7 +663,7 @@ list_nodes() {
      else .value.user end)
   ] | @tsv' "$NODES" \
     | while IFS=$'\t' read -r i t p d; do
-      printf "  ${C}%-4s${N} %-15s ${B}%-7s${N} ${D}%s${N}\n" "$i" "$t" "$p" "$d"
+      printf "${C}%-4s${N} %-15s ${B}%-7s${N} ${D}%s${N}\n" "$i" "$t" "$p" "$d"
     done
 }
 
@@ -664,7 +703,7 @@ show_link() {
   local name host meta
   meta=$(jq -r --argjson i "$IDX" '(.[$i] // {}) | [(.tag // ""), (.host // "")] | join("\u001f")' "$NODES")
   IFS=$'\x1f' read -r name host <<<"$meta"
-  printf "  ${B}%s${N}\n" "$name"
+  printf "${B}%s${N}\n" "$name"
   if [[ -n $host ]]; then
     printf "${G}%s${N}\n" "$(build_link "$host")"
     return
@@ -778,7 +817,7 @@ edit_field() {
       ;;
     transport)
       local nt
-      printf "${C}1${N}  RAW (Vision)\n   ${C}2${N}  XHTTP\n"
+      printf "${C}1${N}  RAW (Vision)\n${C}2${N}  XHTTP\n"
       while :; do
         ask "传输方式（0=取消）" "${cur:-raw}"
         [[ $REPLY == 0 ]] && return 1
@@ -805,8 +844,23 @@ edit_field() {
       fi
       ;;
     sni)
-      _ask_match "新伪装域名" "$cur" "$cur" '^[^[:space:]/\:]+$' "域名 / SNI 格式无效" || return 1
-      setf "$IDX" sni "$REPLY"
+      while :; do
+        ask "新伪装域名（0=取消）" "$cur"
+        [[ $REPLY == 0 || $REPLY == "$cur" ]] && return 1
+        valid_sni "$REPLY" && break
+        err "域名 / SNI 格式无效"
+      done
+      if [[ $(g insecure) == 0 && -n $(g host) ]]; then
+        jqw --argjson i "$IDX" --arg s "$REPLY" '.[$i].sni=$s | .[$i].host=$s'
+        note "已同步更新链接域名，请确保证书匹配新域名"
+        sleep 0.8
+      else
+        setf "$IDX" sni "$REPLY"
+      fi
+      ;;
+    pass)
+      _ask_match "新密码" "$cur" "$cur" '.+' "不能为空" || return 1
+      setf "$IDX" pass "$REPLY"
       ;;
     path)
       _ask_match "新路径" "$cur" "$cur" '^/[^[:space:]]*$' "路径须以 / 开头且不含空格" || return 1
@@ -916,7 +970,7 @@ menu_service() {
     title "服务管理"
     auto="${D}[已关闭]${N}"
     svc_ctl is-enabled && auto="${G}[已开启]${N}"
-    printf "${C}1${N}  启动 / 重启\n   ${C}2${N}  停止服务\n   ${C}3${N}  开机自启  %s\n   ${C}0${N}  返回\n" "$auto"
+    printf "${C}1${N}  启动 / 重启\n${C}2${N}  停止服务\n${C}3${N}  开机自启  %s\n${C}0${N}  返回\n" "$auto"
     read -rp "> " c || return
     [[ -z $c ]] && continue
     [[ $c == 0 ]] && return
@@ -1033,3 +1087,4 @@ elif [[ ! -f $0 && ! -x /usr/local/bin/xr && -n $SCRIPT_URL ]]; then
   curl -fsSL "$SCRIPT_URL" -o /usr/local/bin/xr 2>/dev/null && chmod 755 /usr/local/bin/xr
 fi
 main_menu
+
