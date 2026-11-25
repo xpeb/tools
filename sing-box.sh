@@ -268,10 +268,10 @@ init_dirs() {
   [[ -f $NODES ]] || { echo '[]' >"$NODES"; chmod 600 "$NODES"; }
 }
 
-_download_sb() { # $1=ver $2=arch $3=tmp_dir [$4=expected_sha256]
+_download_sb() { # $1=ver $2=target $3=tmp_dir [$4=expected_sha256]
   local pkg="sing-box-$1-linux-$2"
   local url="https://github.com/SagerNet/sing-box/releases/download/v$1/$pkg.tar.gz"
-  local expected=${4:-} actual
+  local expected=${4:-} actual bin_path
   info "正在下载 sing-box v$1（$2）…"
   curl -fsSL -o "$3/sb.tar.gz" "$url" 2>/dev/null || { err "安装包下载失败"; return 1; }
   if [[ -n $expected ]]; then
@@ -282,17 +282,22 @@ _download_sb() { # $1=ver $2=arch $3=tmp_dir [$4=expected_sha256]
     warn "未获取到上游 SHA256 摘要，跳过完整性校验"
   fi
   info "正在安装二进制文件与系统服务…"
-  if ! tar -xzf "$3/sb.tar.gz" -C "$3" "$pkg/sing-box" 2>/dev/null \
-    || ! install -m755 "$3/$pkg/sing-box" "$SB_BIN.new" 2>/dev/null \
+  if ! tar -xzf "$3/sb.tar.gz" -C "$3" 2>/dev/null; then
+    err "解压安装包失败"
+    return 1
+  fi
+  bin_path=$(find "$3" -maxdepth 2 -type f -name sing-box | head -n 1)
+  if [[ -z $bin_path ]] \
+    || ! install -m755 "$bin_path" "$SB_BIN.new" 2>/dev/null \
     || ! mv -f "$SB_BIN.new" "$SB_BIN" 2>/dev/null; then
     rm -f "$SB_BIN.new"
-    err "解压或写入可执行文件失败"
+    err "提取或写入可执行文件失败"
     return 1
   fi
 }
 
 install_sb() {
-  local arch ver tmp eff_url rel_json sha="" v rc=0
+  local arch target ver tmp eff_url rel_json sha="" v rc=0
   case $(uname -m) in
     x86_64 | amd64) arch=amd64 ;;
     aarch64 | arm64) arch=arm64 ;;
@@ -300,12 +305,14 @@ install_sb() {
     i386 | i686) arch=386 ;;
     *) err "不支持的系统架构：$(uname -m)"; return 1 ;;
   esac
+  target=$arch
+  [[ $OS == alpine ]] && target+="-musl"
   info "正在查询最新 sing-box 版本…"
   rel_json=$(curl -fsSL -m 10 https://api.github.com/repos/SagerNet/sing-box/releases/latest 2>/dev/null || true)
   if [[ -n $rel_json ]]; then
     ver=$(jq -r '.tag_name // empty' <<<"$rel_json" 2>/dev/null | sed 's/^v//')
     if [[ -n $ver ]]; then
-      sha=$(jq -r --arg name "sing-box-$ver-linux-$arch.tar.gz" \
+      sha=$(jq -r --arg name "sing-box-$ver-linux-$target.tar.gz" \
         '(.assets // [])[] | select(.name == $name) | .digest // empty' <<<"$rel_json" 2>/dev/null | sed 's/^sha256://')
     fi
   fi
@@ -321,13 +328,17 @@ install_sb() {
     confirm "是否强制重新安装？" || return 2
   fi
   tmp=$(mktemp -d "$RUN_TMP"/dl.XXXXXX) || { err "创建临时下载目录失败"; return 1; }
-  _download_sb "$ver" "$arch" "$tmp" "$sha" || rc=$?
+  _download_sb "$ver" "$target" "$tmp" "$sha" || rc=$?
   rm -rf "$tmp"
   ((rc == 0)) || return 1
   init_dirs
   svc_install
   v=$(sb_version)
-  [[ -n $v ]] || { err "安装完成但无法执行 sing-box"; return 1; }
+  if [[ -z $v ]]; then
+    err "安装完成但无法执行 sing-box"
+    "$SB_BIN" version 2>&1 | head -n 3
+    return 1
+  fi
   ok "sing-box v$v 安装完成"
 }
 
