@@ -381,15 +381,21 @@ gen_config() {
   la=$(listen_addr)
   jq --arg la "$la" '{
     log: {level: "warn", timestamp: true},
+    dns: {
+      servers: [{type: "local", tag: "local"}]
+    },
     inbounds: [ .[] |
       if .type == "socks" then
         {type: "socks", tag: .tag, listen: $la, listen_port: .port,
+         reuse_addr: true, tcp_fast_open: true,
          users: [{username: .user, password: .pass}]}
       elif .type == "shadowsocks" then
         {type: "shadowsocks", tag: .tag, listen: $la, listen_port: .port,
+         reuse_addr: true, tcp_fast_open: true,
          method: .method, password: .password}
       elif .type == "hysteria2" then
         {type: "hysteria2", tag: .tag, listen: $la, listen_port: .port,
+         reuse_addr: true,
          users: [{name: .tag, password: .password}],
          tls: {enabled: true, server_name: .sni, alpn: ["h3"], certificate_path: .cert, key_path: .key}}
         + (if (.obfs // "") != "" then
@@ -397,22 +403,31 @@ gen_config() {
            else {} end)
       elif .type == "vless" then
         {type: "vless", tag: .tag, listen: $la, listen_port: .port,
+         reuse_addr: true, tcp_fast_open: true,
          users: [{name: .tag, uuid: .uuid, flow: "xtls-rprx-vision"}],
          tls: {enabled: true, server_name: .sni,
                reality: {enabled: true, handshake: {server: .sni, server_port: 443},
-                         private_key: .priv, short_id: [.sid]}}}
+                         private_key: .priv, short_id: [.sid], max_time_difference: "1m"}}}
       elif .type == "anytls" then
         {type: "anytls", tag: .tag, listen: $la, listen_port: .port,
+         reuse_addr: true, tcp_fast_open: true,
          users: [{name: .tag, password: .password}],
-         tls: {enabled: true, server_name: .sni, certificate_path: .cert, key_path: .key}}
+         tls: {enabled: true, server_name: .sni, min_version: "1.2", certificate_path: .cert, key_path: .key}}
       elif .type == "snell" then
         {type: "snell", tag: .tag, listen: $la, listen_port: .port,
+         reuse_addr: true, tcp_fast_open: true,
          version: .version, psk: .psk}
         + (if .version == 6 then {mode: (.mode // "default")} else {obfs_mode: (.obfs // "none")} end)
       else empty end
     ],
     outbounds: [{type: "direct", tag: "direct"}],
-    route: {final: "direct"}
+    route: {
+      rules: [
+        {ip_cidr: ["127.0.0.0/8", "::1/128", "169.254.0.0/16", "fe80::/10", "224.0.0.0/4", "ff00::/8"], action: "reject"}
+      ],
+      default_domain_resolver: "local",
+      final: "direct"
+    }
   }' "$NODES" >"$out_file"
 }
 

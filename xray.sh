@@ -270,7 +270,7 @@ gen_config() {
   jq --arg l "$listen_ip" '{
     log: {loglevel: "warning"},
     inbounds: map(
-      if .type == "socks" then
+      (if .type == "socks" then
         {
           tag: .tag, listen: $l, port: .port, protocol: "socks",
           settings: {auth: "password", users: [{user: .user, pass: .pass}], udp: true}
@@ -285,8 +285,8 @@ gen_config() {
           tag: .tag, listen: $l, port: .port, protocol: "trojan",
           settings: {users: [{password: .password}]},
           streamSettings: {
-            network: "raw", security: "tls",
-            tlsSettings: {certificates: [{certificateFile: .cert, keyFile: .key}]}
+            method: "raw", security: "tls",
+            tlsSettings: {alpn: ["h2", "http/1.1"], certificates: [{certificateFile: .cert, keyFile: .key}]}
           }
         }
       elif .type == "vless" then
@@ -298,7 +298,7 @@ gen_config() {
           },
           streamSettings: (
             {
-              network: (.transport // "raw"),
+              method: (.transport // "raw"),
               security: "reality",
               realitySettings: {
                 target: (.sni + ":443"), serverNames: [.sni],
@@ -312,10 +312,10 @@ gen_config() {
           tag: .tag, listen: $l, port: .port, protocol: "vmess",
           settings: {users: [{id: .uuid}]},
           streamSettings: {
-            network: "ws",
+            method: "websocket",
             wsSettings: {path: .path},
             security: "tls",
-            tlsSettings: {certificates: [{certificateFile: .cert, keyFile: .key}]}
+            tlsSettings: {alpn: ["http/1.1"], certificates: [{certificateFile: .cert, keyFile: .key}]}
           }
         }
       elif .type == "hysteria2" then
@@ -323,13 +323,15 @@ gen_config() {
           tag: .tag, listen: $l, port: .port, protocol: "hysteria",
           settings: {version: 2, users: [{auth: .password}]},
           streamSettings: {
-            network: "hysteria",
-            hysteriaSettings: {version: 2, auth: .password},
+            method: "hysteria",
+            hysteriaSettings: {version: 2},
             security: "tls",
             tlsSettings: {alpn: ["h3"], certificates: [{certificateFile: .cert, keyFile: .key}]}
           }
         }
-      else empty end
+      else empty end) + {
+        sniffing: {enabled: true, destOverride: ["http", "tls", "quic"]}
+      }
     ),
     outbounds: [{protocol: "freedom", tag: "direct"}],
     routing: {domainStrategy: "AsIs", rules: []}
