@@ -43,7 +43,11 @@ title() {
   line
 }
 
-trap 'rm -rf "${TMPDIR:-/tmp}"/sb-panel.* "$CONF.new" 2>/dev/null' EXIT INT TERM
+RUN_TMP=$(mktemp -d -t sb-panel.XXXXXX)
+CONF_TMP="$RUN_TMP/config.json.new"
+cleanup() { [[ -n $RUN_TMP ]] && rm -rf "$RUN_TMP"; }
+trap cleanup EXIT
+trap 'cleanup; echo; exit 130' INT TERM
 init_dirs() {
   mkdir -p "$SB_DIR" "$CERT_DIR" && chmod 700 "$SB_DIR" "$CERT_DIR"
   [[ -f $NODES ]] || {
@@ -139,10 +143,14 @@ svc_ctl() { # start|restart|stop|enable|disable|is-active|is-enabled
 }
 
 svc_logs() {
+  local out=""
   if [[ $OS == debian ]]; then
-    journalctl -u sing-box -n 40 --no-pager -o cat 2>/dev/null | sed 's/^/  /'
+    out=$(journalctl -u sing-box -n 40 --no-pager -o cat 2>/dev/null)
   elif [[ -f $SB_LOG ]]; then
-    tail -n 40 "$SB_LOG" | sed 's/^/  /'
+    out=$(tail -n 40 "$SB_LOG" 2>/dev/null)
+  fi
+  if [[ -n $out ]]; then
+    printf '%s\n' "$out" | sed 's/^/  /'
   else
     info "暂无日志"
   fi
@@ -151,7 +159,7 @@ svc_logs() {
 _fetch_ip() { # $1=-4|-6 $2=regex
   local ip u
   for u in https://api${1#-}.ipify.org https://ip.sb https://ifconfig.me; do
-    ip=$(curl -s "$1" -m 3 "$u" 2>/dev/null | tr -d '[:space:]')
+    ip=$(curl -s "$1" -m 2 "$u" 2>/dev/null | tr -d '[:space:]')
     [[ $ip =~ $2 ]] && {
       echo "$ip"
       return 0
@@ -162,8 +170,11 @@ _fetch_ip() { # $1=-4|-6 $2=regex
 detect_ips() {
   [[ -n ${IP_DETECTED:-} ]] && return
   IP_DETECTED=1
-  PUBIP4=$(_fetch_ip -4 '^[0-9.]+$')
-  PUBIP6=$(_fetch_ip -6 '^[0-9a-fA-F:]+:[0-9a-fA-F:]*$')
+  _fetch_ip -4 '^[0-9.]+$' >"$RUN_TMP/ip4" &
+  _fetch_ip -6 '^[0-9a-fA-F:]+:[0-9a-fA-F:]*$' >"$RUN_TMP/ip6" &
+  wait
+  [[ -s $RUN_TMP/ip4 ]] && PUBIP4=$(<"$RUN_TMP/ip4") || PUBIP4=""
+  [[ -s $RUN_TMP/ip6 ]] && PUBIP6=$(<"$RUN_TMP/ip6") || PUBIP6=""
 }
 
 sb_installed() { [[ -x $SB_BIN ]]; }
@@ -176,7 +187,7 @@ core_ok() {
 }
 
 install_singbox() {
-  local arch ver tmp
+  local arch ver tmp libc="-glibc"
   case $(uname -m) in
     x86_64 | amd64) arch=amd64 ;; aarch64 | arm64) arch=arm64 ;;
     armv7l) arch=armv7 ;; i386 | i686) arch=386 ;;
@@ -185,14 +196,18 @@ install_singbox() {
       return 1
       ;;
   esac
+  [[ $OS == alpine ]] && libc="-musl"
   ver=$(curl -fsSL -m 10 https://api.github.com/repos/SagerNet/sing-box/releases/latest 2>/dev/null | jq -r '.tag_name // empty' | sed 's/^v//')
   if [[ -z $ver ]]; then
     err "获取最新版本失败"
     confirm "是否改用最低支持版本 $MIN_VER 安装？" || return 1
     ver=$MIN_VER
+  elif sb_installed && [[ $(sb_version) == "$ver" ]]; then
+    ok "当前已是最新版本 v$ver"
+    confirm "是否强制重新安装？" || return 1
   fi
-  tmp=$(mktemp -d -t sb-panel.XXXXXX)
-  if ! curl -fsSL -o "$tmp/sb.tgz" "https://github.com/SagerNet/sing-box/releases/download/v$ver/sing-box-$ver-linux-$arch.tar.gz" 2>/dev/null \
+  tmp=$(mktemp -d "$RUN_TMP"/dl.XXXXXX)
+  if ! curl -fsSL -o "$tmp/sb.tgz" "https://github.com/SagerNet/sing-box/releases/download/v$ver/sing-box-$ver-linux-$arch$libc.tar.gz" 2>/dev/null \
     || ! tar -xzf "$tmp/sb.tgz" -C "$tmp" 2>/dev/null || ! install -m755 "$tmp"/sing-box-*/sing-box "$SB_BIN" 2>/dev/null; then
     err "下载或安装失败"
     rm -rf "$tmp"
@@ -201,7 +216,13 @@ install_singbox() {
   rm -rf "$tmp"
   init_dirs
   svc_install
-  ok "sing-box $(sb_version) 已安装"
+  local v
+  v=$(sb_version)
+  if [[ -z $v ]]; then
+    err "安装后无法执行，请检查系统库兼容性"
+    return 1
+  fi
+  ok "sing-box $v 已安装"
 }
 
 # ───────── 配置生成（严格遵循 sing-box 官方结构）─────────
@@ -238,37 +259,44 @@ gen_config() {
     ],
     outbounds: [{type: "direct", tag: "direct"}],
     route: {final: "direct"}
-  }' "$NODES" >"$CONF.new"
+  }' "$NODES" >"$CONF_TMP"
 }
 
 apply() {
   gen_config
   local out
-  if ! out=$("$SB_BIN" check -c "$CONF.new" 2>&1); then
+  if ! out=$("$SB_BIN" check -c "$CONF_TMP" 2>&1); then
     err "配置校验失败"
     echo "$out" | sed 's/^/    /'
     core_ok || warn "Snell / gecko 需要 sing-box >= $MIN_VER，请先更新内核"
-    rm -f "$CONF.new"
+    rm -f "$CONF_TMP"
     return 1
   fi
-  chmod 600 "$CONF.new" && mv "$CONF.new" "$CONF"
+  if ! { chmod 600 "$CONF_TMP" && mv "$CONF_TMP" "$CONF"; }; then
+    err "写入配置失败"
+    rm -f "$CONF_TMP"
+    return 1
+  fi
   if [[ $(jq length "$NODES") -eq 0 ]]; then
     svc_ctl stop
     return 0
   fi
   svc_ctl enable
   svc_ctl restart
-  sleep 1
-  svc_ctl is-active && ok "配置已生效" || {
-    err "服务启动失败，请查看日志"
-    return 1
-  }
+  local i
+  for i in 1 2 3 4 5 6; do
+    sleep 0.5
+    svc_ctl is-active && {
+      ok "配置已生效"
+      return 0
+    }
+  done
+  err "服务启动失败，请查看日志"
+  return 1
 }
 
 # ───────── 通用辅助 ─────────
 rnd() { tr -dc 'A-Za-z0-9' </dev/urandom | head -c "${1:-16}"; }
-b64u() { printf %s "$1" | base64 | tr -d '\r\n' | tr '+/' '-_' | tr -d '='; }
-uri_enc() { jq -rn --arg v "$1" '$v|@uri'; }
 valid_port() { [[ $1 =~ ^[0-9]{1,5}$ ]] && ((10#$1 >= 1 && 10#$1 <= 65535)); }
 valid_sni() { [[ -n $1 && ! $1 =~ [[:space:]/\\:] ]]; }
 valid_ss2022_psk() {
@@ -356,17 +384,21 @@ ask_cert() {
 
 jqw() {
   local t
-  t=$(mktemp -t sb-panel.XXXXXX)
+  t=$(mktemp "$RUN_TMP"/jq.XXXXXX)
   jq "$@" "$NODES" >"$t" && chmod 600 "$t" && mv "$t" "$NODES"
+}
+snapshot() {
+  BAK="$RUN_TMP/nodes.$$.$RANDOM.bak"
+  cp "$NODES" "$BAK"
 }
 rollback() {
   cp "$1" "$NODES"
   chmod 600 "$NODES"
+  gen_config 2>/dev/null && chmod 600 "$CONF_TMP" && mv "$CONF_TMP" "$CONF"
+  svc_ctl restart
   err "$2"
 }
 setf() { jqw --argjson i "$1" --arg k "$2" --arg v "$3" '.[$i][$k]=$v'; }
-setn() { jqw --argjson i "$1" --arg k "$2" --argjson v "$3" '.[$i][$k]=$v'; }
-delk() { jqw --argjson i "$1" --arg k "$2" 'del(.[$i][$k])'; }
 g() { jq -r --argjson i "$IDX" --arg k "$1" '.[$i][$k] // empty' "$NODES"; }
 
 choose_node() { # 交互选择节点并设置 IDX；取消返回 1
@@ -491,7 +523,7 @@ add_anytls() {
 add_snell() {
   ensure_core "Snell" || return 1
   ask_port
-  local v o=none psk
+  local v o=none psk oh=""
   while :; do
     ask "版本 5/6" "5"
     [[ $REPLY == 5 || $REPLY == 6 ]] && {
@@ -515,10 +547,11 @@ add_snell() {
       }
       err "仅支持 none 或 http"
     done
+    [[ $o == http ]] && ask_sni "混淆域名" oh
   fi
-  jqw --argjson port "$PORT" --argjson v "$v" --arg p "$psk" --arg o "$o" \
+  jqw --argjson port "$PORT" --argjson v "$v" --arg p "$psk" --arg o "$o" --arg oh "$oh" \
     '. + [{type:"snell",tag:("snell-"+($port|tostring)),port:$port,version:$v,psk:$p}
-     + (if $v==6 then {mode:"default"} else {obfs:$o} end)]'
+     + (if $v==6 then {mode:"default"} elif $o=="http" then {obfs:$o,obfs_host:$oh} else {obfs:$o} end)]'
 }
 
 menu_add() {
@@ -531,21 +564,18 @@ menu_add() {
   read -rp "  > " c
   echo
   [[ -z $c || $c == 0 || $c == q ]] && return
-  local n bak
+  local n
   n=$(jq length "$NODES")
-  bak=$(mktemp -t sb-panel.XXXXXX)
-  cp "$NODES" "$bak"
+  snapshot
   case $c in
     1) add_socks ;; 2) add_ss ;; 3) add_hy2 ;; 4) add_vless ;; 5) add_anytls ;; 6) add_snell ;;
     *)
       err "无效选项"
-      rm -f "$bak"
       pause
       return
       ;;
   esac
   if [[ $(jq length "$NODES") -eq $n ]]; then
-    rm -f "$bak"
     pause
     return
   fi
@@ -555,9 +585,8 @@ menu_add() {
     show_link "$IDX"
     note "云服务器请在安全组放行端口 $(g port)"
   else
-    rollback "$bak" "已撤销本次添加"
+    rollback "$BAK" "已撤销本次添加"
   fi
-  rm -f "$bak"
   pause
 }
 
@@ -578,44 +607,36 @@ list_nodes() {
     | while read -r i t p m; do printf "  ${C}%-3s${N} %-13s %-7s ${D}%s${N}\n" "$i" "$t" "$p" "$m"; done
 }
 
-build_link() { # $1=raw_ip
-  local raw_ip=$1 ip=$1 ot ver
-  [[ $ip == *:* ]] && ip="[$ip]"
-  case $t in
-    socks)
-      echo "socks5://$(uri_enc "$(g user)"):$(uri_enc "$(g pass)")@$ip:$port#$(uri_enc "$name")"
-      ;;
-    shadowsocks)
-      echo "ss://$(b64u "$(g method):$(g password)")@$ip:$port#$(uri_enc "$name")"
-      ;;
-    hysteria2)
-      ot=$(g obfs_type)
-      local l="hysteria2://$(uri_enc "$(g password)")@$ip:$port/?sni=$(uri_enc "$(g sni)")&insecure=$(g insecure)"
-      [[ -n $(g obfs) ]] && l+="&obfs=$(uri_enc "${ot:-salamander}")&obfs-password=$(uri_enc "$(g obfs)")"
-      echo "$l#$(uri_enc "$name")"
-      ;;
-    vless)
-      echo "vless://$(uri_enc "$(g uuid)")@$ip:$port?encryption=none&flow=xtls-rprx-vision&security=reality&sni=$(uri_enc "$(g sni)")&fp=chrome&pbk=$(uri_enc "$(g pub)")&sid=$(uri_enc "$(g sid)")&type=tcp#$(uri_enc "$name")"
-      ;;
-    anytls)
-      echo "anytls://$(uri_enc "$(g password)")@$ip:$port/?sni=$(uri_enc "$(g sni)")&insecure=$(g insecure)#$(uri_enc "$name")"
-      ;;
-    snell)
-      ver=$(g version)
-      local l="$name = snell, $raw_ip, $port, psk=$(g psk), version=$ver, reuse=true, tfo=true"
-      [[ $ver == 5 && $(g obfs) == http ]] && l+=", obfs=http, obfs-host=$DEFAULT_SNI"
-      echo "$l"
-      ;;
-  esac
+build_link() { # $1=raw_ip；单次 jq 完成编码与拼接
+  jq -r --argjson i "$IDX" --arg ip "$1" --arg dsn "$DEFAULT_SNI" '
+    def br: if test(":") then "[" + . + "]" else . end;
+    def e: (. // "") | @uri;
+    def b64: @base64 | gsub("\\+"; "-") | gsub("/"; "_") | sub("=+$"; "");
+    (.[$i] // {}) as $n | ($ip | br) as $h
+    | if $n.type == "socks" then
+        "socks5://\($n.user | e):\($n.pass | e)@\($h):\($n.port)#\($n.tag | e)"
+      elif $n.type == "shadowsocks" then
+        "ss://\(($n.method // "") + ":" + ($n.password // "") | b64)@\($h):\($n.port)#\($n.tag | e)"
+      elif $n.type == "hysteria2" then
+        "hysteria2://\($n.password | e)@\($h):\($n.port)/?sni=\($n.sni | e)&insecure=\($n.insecure // 0)"
+        + (if ($n.obfs // "") != "" then "&obfs=\(($n.obfs_type // "salamander") | e)&obfs-password=\($n.obfs | e)" else "" end)
+        + "#\($n.tag | e)"
+      elif $n.type == "vless" then
+        "vless://\($n.uuid | e)@\($h):\($n.port)?encryption=none&flow=xtls-rprx-vision&security=reality&sni=\($n.sni | e)&fp=chrome&pbk=\($n.pub | e)&sid=\($n.sid | e)&type=tcp#\($n.tag | e)"
+      elif $n.type == "anytls" then
+        "anytls://\($n.password | e)@\($h):\($n.port)/?sni=\($n.sni | e)&insecure=\($n.insecure // 0)#\($n.tag | e)"
+      elif $n.type == "snell" then
+        "\($n.tag) = snell, \($ip), \($n.port), psk=\($n.psk // ""), version=\($n.version // ""), reuse=true, tfo=true"
+        + (if ($n.version == 5 and $n.obfs == "http") then ", obfs=http, obfs-host=\($n.obfs_host // $dsn)" else "" end)
+      else "" end
+  ' "$NODES"
 }
 
 show_link() {
   IDX=$1
-  local t port host name
-  t=$(g type)
-  port=$(g port)
-  name=$(g tag)
-  host=$(g host)
+  local name t host meta
+  meta=$(jq -r --argjson i "$IDX" '(.[$i] // {}) | [(.tag // ""), (.type // ""), (.host // "")] | join("\u001f")' "$NODES")
+  IFS=$'\x1f' read -r name t host <<<"$meta"
   printf "  ${B}%s${N}" "$name"
   [[ $t == snell ]] && printf "  ${D}(Surge)${N}"
   echo
@@ -645,21 +666,21 @@ menu_links() {
   local n
   n=$(jq length "$NODES")
   line
+  local i
   while :; do
     ask "编号（a=全部，0=返回）" "a"
-    [[ $REPLY == 0 || $REPLY == q ]] && return
+    [[ -z $REPLY || $REPLY == 0 || $REPLY == q ]] && return
     if [[ $REPLY == a ]]; then
       echo
-      local i
       for ((i = 0; i < n; i++)); do show_link "$i"; done
       break
-    elif [[ $REPLY =~ ^[0-9]{1,4}$ ]] && ((10#$REPLY >= 1 && 10#$REPLY <= n)); then
+    fi
+    if [[ $REPLY =~ ^[0-9]{1,4}$ ]] && ((10#$REPLY >= 1 && 10#$REPLY <= n)); then
       echo
       show_link "$((10#$REPLY - 1))"
       break
-    else
-      err "编号无效（1-$n 或 a）"
     fi
+    err "编号无效（1-$n 或 a）"
   done
   pause
 }
@@ -674,7 +695,12 @@ node_fields() {
     anytls) FIELDS=("port:端口" "password:密码" "_cert:证书 / SNI") ;;
     snell)
       FIELDS=("port:端口" "psk:PSK" "version:版本")
-      [[ $(g version) == 6 ]] && FIELDS+=("mode:流量整形") || FIELDS+=("obfs:HTTP 混淆")
+      if [[ $(g version) == 6 ]]; then
+        FIELDS+=("mode:流量整形")
+      else
+        FIELDS+=("obfs:HTTP 混淆")
+        [[ $(g obfs) == http ]] && FIELDS+=("obfs_host:混淆域名")
+      fi
       ;;
   esac
 }
@@ -684,94 +710,122 @@ edit_field() {
   cur=$(g "$k")
   case $k in
     port)
-      ask "新端口" "$cur"
-      valid_port "$REPLY" || {
-        err "端口无效 (1-65535)"
-        return 1
-      }
-      np=$((10#$REPLY))
-      [[ $np == "$cur" ]] && return 1
-      port_free "$np" || {
+      while :; do
+        ask "新端口（0=取消）" "$cur"
+        [[ $REPLY == 0 || $REPLY == "$cur" ]] && return 1
+        valid_port "$REPLY" || {
+          err "端口无效 (1-65535)"
+          continue
+        }
+        np=$((10#$REPLY))
+        port_free "$np" && break
         err "端口已被占用"
-        return 1
-      }
-      setf "$IDX" tag "$(g tag | sed "s/-$cur\$/-$np/")"
-      setn "$IDX" port "$np"
+      done
+      local tag
+      tag=$(g tag | sed "s/-$cur\$/-$np/")
+      jqw --argjson i "$IDX" --arg t "$tag" --argjson p "$np" '.[$i].tag=$t | .[$i].port=$p'
       ;;
     method)
       pick_ss_method
-      setf "$IDX" method "$SS_M"
-      setf "$IDX" password "$SS_P"
+      jqw --argjson i "$IDX" --arg m "$SS_M" --arg p "$SS_P" '.[$i].method=$m | .[$i].password=$p'
       note "已按新加密方式重新生成密码"
+      pause
       ;;
     password)
-      ask "新密码" "$cur"
-      [[ -n $REPLY ]] || {
-        err "不能为空"
-        return 1
-      }
-      if [[ $(g type) == shadowsocks && $(g method) == 2022-blake3-* ]]; then
-        valid_ss2022_psk "$(g method)" "$REPLY" || {
-          err "SS 2022 密码须为对应长度（16/32 字节）的 Base64"
-          return 1
+      while :; do
+        ask "新密码（0=取消）" "$cur"
+        [[ $REPLY == 0 || $REPLY == "$cur" ]] && return 1
+        [[ -n $REPLY ]] || {
+          err "不能为空"
+          continue
         }
-      fi
+        if [[ $(g type) == shadowsocks && $(g method) == 2022-blake3-* ]]; then
+          valid_ss2022_psk "$(g method)" "$REPLY" || {
+            err "SS 2022 密码须为对应长度（16/32 字节）的 Base64"
+            continue
+          }
+        fi
+        break
+      done
       setf "$IDX" password "$REPLY"
       ;;
-    sni)
-      ask "新伪装域名" "$cur"
-      valid_sni "$REPLY" || {
-        err "域名 / SNI 格式无效"
-        return 1
+    sni | obfs_host)
+      local label="新伪装域名" def=$cur
+      [[ $k == obfs_host ]] && {
+        label="新混淆域名"
+        def=${cur:-$DEFAULT_SNI}
       }
-      setf "$IDX" sni "$REPLY"
+      while :; do
+        ask "$label（0=取消）" "$def"
+        [[ $REPLY == 0 || $REPLY == "$cur" ]] && return 1
+        valid_sni "$REPLY" && break
+        err "域名 / SNI 格式无效"
+      done
+      setf "$IDX" "$k" "$REPLY"
       ;;
     version)
-      ask "版本 5/6" "$cur"
-      [[ $REPLY == 5 || $REPLY == 6 ]] || {
+      while :; do
+        ask "版本 5/6（0=取消）" "$cur"
+        [[ $REPLY == 0 || $REPLY == "$cur" ]] && return 1
+        [[ $REPLY == 5 || $REPLY == 6 ]] && break
         err "仅支持 5 或 6"
-        return 1
-      }
-      [[ $REPLY == "$cur" ]] && return 1
-      setn "$IDX" version "$REPLY"
+      done
       if [[ $REPLY == 6 ]]; then
-        setf "$IDX" mode default
-        delk "$IDX" obfs
         psk=$(g psk)
-        ((${#psk} >= 12 && ${#psk} <= 255)) || {
-          setf "$IDX" psk "$(rnd 20)"
+        if ((${#psk} >= 12 && ${#psk} <= 255)); then
+          jqw --argjson i "$IDX" '.[$i].version=6 | .[$i].mode="default" | del(.[$i].obfs, .[$i].obfs_host)'
+        else
+          jqw --argjson i "$IDX" --arg p "$(rnd 20)" \
+            '.[$i].version=6 | .[$i].mode="default" | .[$i].psk=$p | del(.[$i].obfs, .[$i].obfs_host)'
           note "v6 要求 PSK 12-255 字节，已重新生成"
-        }
+          pause
+        fi
       else
-        setf "$IDX" obfs none
-        delk "$IDX" mode
+        jqw --argjson i "$IDX" '.[$i].version=5 | .[$i].obfs="none" | del(.[$i].mode)'
       fi
       ;;
     obfs)
       if [[ $(g type) == snell ]]; then
-        ask "HTTP 混淆 none/http" "${cur:-none}"
-        [[ $REPLY == none || $REPLY == http ]] || {
+        while :; do
+          ask "HTTP 混淆 none/http（0=取消）" "${cur:-none}"
+          [[ $REPLY == 0 || $REPLY == "${cur:-none}" ]] && return 1
+          [[ $REPLY == none || $REPLY == http ]] && break
           err "仅支持 none 或 http"
-          return 1
-        }
-        setf "$IDX" obfs "$REPLY"
+        done
+        if [[ $REPLY == http ]]; then
+          local oh
+          oh=$(g obfs_host)
+          [[ -n $oh ]] || oh=$DEFAULT_SNI
+          jqw --argjson i "$IDX" --arg oh "$oh" '.[$i].obfs="http" | .[$i].obfs_host=$oh'
+        else
+          jqw --argjson i "$IDX" '.[$i].obfs="none" | del(.[$i].obfs_host)'
+        fi
       else
         ask "新混淆密码（-=关闭）" "$cur"
         [[ $REPLY == "-" ]] && REPLY=""
-        setf "$IDX" obfs "$REPLY"
+        [[ $REPLY == "$cur" ]] && return 1
         if [[ -z $REPLY ]]; then
-          setf "$IDX" obfs_type ""
-        elif [[ -z $(g obfs_type) ]]; then setf "$IDX" obfs_type salamander; fi
+          jqw --argjson i "$IDX" '.[$i] += {obfs:"",obfs_type:""}'
+        else
+          local ot
+          ot=$(g obfs_type)
+          jqw --argjson i "$IDX" --arg op "$REPLY" --arg ot "${ot:-salamander}" \
+            '.[$i] += {obfs:$op,obfs_type:$ot}'
+        fi
       fi
       ;;
     obfs_type)
-      pick_hy2_obfs || return 1
+      pick_hy2_obfs || {
+        pause
+        return 1
+      }
       if [[ -n $OBFS_T ]]; then
         local op
         op=$(g obfs)
         [[ -n $op ]] || {
           op=$(rnd 16)
           note "已生成混淆密码"
+          pause
         }
         jqw --argjson i "$IDX" --arg ot "$OBFS_T" --arg op "$op" '.[$i] += {obfs_type:$ot,obfs:$op}'
       else
@@ -779,39 +833,46 @@ edit_field() {
       fi
       ;;
     mode)
-      ask "模式 default/unshaped/unsafe-raw" "${cur:-default}"
-      [[ $REPLY == default || $REPLY == unshaped || $REPLY == unsafe-raw ]] || {
+      while :; do
+        ask "模式 default/unshaped/unsafe-raw（0=取消）" "${cur:-default}"
+        [[ $REPLY == 0 || $REPLY == "${cur:-default}" ]] && return 1
+        [[ $REPLY == default || $REPLY == unshaped || $REPLY == unsafe-raw ]] && break
         err "模式无效"
-        return 1
-      }
+      done
       setf "$IDX" mode "$REPLY"
       ;;
     psk)
-      ask "新 PSK" "$cur"
-      valid_snell_psk "$(g version)" "$REPLY" || {
+      while :; do
+        ask "新 PSK（0=取消）" "$cur"
+        [[ $REPLY == 0 || $REPLY == "$cur" ]] && return 1
+        valid_snell_psk "$(g version)" "$REPLY" && break
         err "PSK 无效（v6 须为 12-255 字节）"
-        return 1
-      }
+      done
       setf "$IDX" psk "$REPLY"
       ;;
     uuid)
-      ask "新 UUID" "$cur"
-      [[ $REPLY =~ ^[0-9a-fA-F]{8}(-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}$ ]] || {
+      while :; do
+        ask "新 UUID（0=取消）" "$cur"
+        [[ $REPLY == 0 || $REPLY == "$cur" ]] && return 1
+        [[ $REPLY =~ ^[0-9a-fA-F]{8}(-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}$ ]] && break
         err "UUID 格式无效"
-        return 1
-      }
+      done
       setf "$IDX" uuid "$REPLY"
       ;;
     sid)
-      ask "新 ShortID（偶数位十六进制，最长 16 位）" "$cur"
-      [[ $REPLY =~ ^([0-9a-fA-F]{2}){1,8}$ ]] || {
+      while :; do
+        ask "新 ShortID（偶数位十六进制，最长 16 位，0=取消）" "$cur"
+        [[ $REPLY == 0 || $REPLY == "$cur" ]] && return 1
+        [[ $REPLY =~ ^([0-9a-fA-F]{2}){1,8}$ ]] && break
         err "ShortID 格式无效"
-        return 1
-      }
+      done
       setf "$IDX" sid "$REPLY"
       ;;
     _cert)
-      ask_cert || return 1
+      ask_cert || {
+        pause
+        return 1
+      }
       jqw --argjson i "$IDX" --arg c "$CERT" --arg k "$KEY" --arg sni "$SNI" --arg h "$HOST" --argjson in "$INSECURE" \
         '.[$i] += {cert:$c,key:$k,sni:$sni,host:$h,insecure:$in}'
       ;;
@@ -820,13 +881,15 @@ edit_field() {
       jqw --argjson i "$IDX" --arg priv "$RPRIV" --arg pub "$RPUB" --arg sid "$RSID" \
         '.[$i] += {priv:$priv,pub:$pub,sid:$sid}'
       ok "已生成新的密钥对"
+      pause
       ;;
     *)
-      ask "新值" "$cur"
-      [[ -n $REPLY ]] || {
+      while :; do
+        ask "新值（0=取消）" "$cur"
+        [[ $REPLY == 0 || $REPLY == "$cur" ]] && return 1
+        [[ -n $REPLY ]] && break
         err "不能为空"
-        return 1
-      }
+      done
       setf "$IDX" "$k" "$REPLY"
       ;;
   esac
@@ -840,9 +903,8 @@ menu_edit() {
   }
   line
   choose_node || return
-  local dirty=0 bak i f k v
-  bak=$(mktemp -t sb-panel.XXXXXX)
-  cp "$NODES" "$bak"
+  local dirty=0 i f k v
+  snapshot
   while :; do
     title "$(g tag)"
     node_fields
@@ -862,9 +924,7 @@ menu_edit() {
     [[ -z $c || $c == 0 || $c == q ]] && break
     if [[ $c =~ ^[0-9]{1,2}$ ]] && ((10#$c >= 1 && 10#$c <= ${#FIELDS[@]})); then
       echo
-      if edit_field "${FIELDS[$((10#$c - 1))]%%:*}"; then
-        dirty=1
-      else pause; fi
+      edit_field "${FIELDS[$((10#$c - 1))]%%:*}" && dirty=1
     fi
   done
   if [[ $dirty == 1 ]]; then
@@ -873,11 +933,10 @@ menu_edit() {
       echo
       show_link "$IDX"
     else
-      rollback "$bak" "配置无效，已回滚修改"
+      rollback "$BAK" "配置无效，已回滚修改"
     fi
     pause
   fi
-  rm -f "$bak"
 }
 
 # ───────── 删除 / 服务 / 日志 / 卸载 ─────────
@@ -889,24 +948,24 @@ menu_del() {
   }
   line
   choose_node || return
-  local port bak
+  local port
   port=$(g port)
   confirm "确认删除 $(g type):$port ?" || return
-  bak=$(mktemp -t sb-panel.XXXXXX)
-  cp "$NODES" "$bak"
+  snapshot
   jqw --argjson i "$IDX" 'del(.[$i])'
   if apply; then
     ok "已删除"
   else
-    rollback "$bak" "配置应用失败，已撤销删除"
+    rollback "$BAK" "配置应用失败，已撤销删除"
   fi
-  rm -f "$bak"
   pause
 }
 
 menu_service() {
   title "服务管理"
-  printf "   ${C}1${N}  启动 / 重启\n   ${C}2${N}  停止服务\n   ${C}3${N}  开机自启 切换\n   ${D}0  返回${N}\n"
+  local auto="${D}[已关闭]${N}"
+  svc_ctl is-enabled && auto="${G}[已开启]${N}"
+  printf "   ${C}1${N}  启动 / 重启\n   ${C}2${N}  停止服务\n   ${C}3${N}  开机自启  %s\n   ${D}0  返回${N}\n" "$auto"
   line
   read -rp "  > " c
   [[ -z $c || $c == 0 || $c == q ]] && return
@@ -916,13 +975,15 @@ menu_service() {
       svc_ctl stop
       ok "服务已停止"
       ;;
-    3) if svc_ctl is-enabled; then
-      svc_ctl disable
-      ok "已关闭开机自启"
-    else
-      svc_ctl enable
-      ok "已开启开机自启"
-    fi ;;
+    3)
+      if svc_ctl is-enabled; then
+        svc_ctl disable
+        ok "已关闭开机自启"
+      else
+        svc_ctl enable
+        ok "已开启开机自启"
+      fi
+      ;;
     *) return ;;
   esac
   pause
@@ -949,12 +1010,13 @@ header() {
   clear
   echo
   if sb_installed; then
-    local st n=0
+    local st n=0 v
     [[ -f $NODES ]] && n=$(jq length "$NODES" 2>/dev/null || echo 0)
     if svc_ctl is-active; then
       st="${G}● 运行中${N}"
     else st="${D}○ 已停止${N}"; fi
-    printf "  ${B}sing-box${N}  %s  ${D}v%s · %s 节点${N}\n" "$st" "$(sb_version)" "$n"
+    v=$(sb_version)
+    printf "  ${B}sing-box${N}  %s  ${D}v%s · %s 节点${N}\n" "$st" "${v:-?}" "$n"
   else
     printf "  ${B}sing-box${N}\n"
   fi
