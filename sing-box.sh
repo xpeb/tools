@@ -16,28 +16,28 @@ DEFAULT_SNI=www.apache.org
 
 # ───────── UI ─────────
 B=$'\e[1m' D=$'\e[2m' G=$'\e[32m' R=$'\e[31m' Y=$'\e[33m' C=$'\e[36m' N=$'\e[0m'
-info() { printf "  ${D}[信息]${N} %s\n" "$*"; }
-note() { printf "  ${C}[注意]${N} %s\n" "$*"; }
-warn() { printf "  ${Y}[警告]${N} %s\n" "$*"; }
-ok() { printf "  ${G}[正确]${N} %s\n" "$*"; }
-err() { printf "  ${R}[错误]${N} %s\n" "$*"; }
+info() { printf "${D}[信息]${N} %s\n" "$*"; }
+note() { printf "${C}[注意]${N} %s\n" "$*"; }
+warn() { printf "${Y}[警告]${N} %s\n" "$*"; }
+ok() { printf "${G}[正确]${N} %s\n" "$*"; }
+err() { printf "${R}[错误]${N} %s\n" "$*"; }
 pause() {
-  read -rsp $'\n  按回车返回…' _
+  read -rsp $'按回车返回…' _
   echo
 }
 ask() {
   local v
-  read -rp "  $1${2:+ [$2]}: " v
+  read -rp "$1${2:+ [$2]}: " v
   REPLY="${v:-${2:-}}"
 }
 confirm() {
   local v
-  read -rp "  $1 [y/N]: " v
+  read -rp "$1 [y/N]: " v
   [[ $v =~ ^[Yy]$ ]]
 }
 title() {
   header
-  printf "  ${C}▸${N} ${B}%s${N}\n\n" "$1"
+  printf "${C}▸${N} ${B}%s${N}\n" "$1"
 }
 
 RUN_TMP=$(mktemp -d -t sb-panel.XXXXXX)
@@ -147,7 +147,7 @@ svc_logs() {
     out=$(tail -n 40 "$SB_LOG" 2>/dev/null)
   fi
   if [[ -n $out ]]; then
-    printf '%s\n' "$out" | sed 's/^/  /'
+    printf '%s\n' "$out" | cat
   else
     info "暂无日志"
   fi
@@ -264,7 +264,7 @@ apply() {
   local out
   if ! out=$("$SB_BIN" check -c "$CONF_TMP" 2>&1); then
     err "配置校验失败"
-    echo "$out" | sed 's/^/    /'
+    echo "$out" | cat
     core_ok || warn "Snell / gecko 需要 sing-box >= $MIN_VER，请先更新内核"
     rm -f "$CONF_TMP"
     return 1
@@ -431,8 +431,8 @@ add_socks() {
 }
 
 pick_ss_method() {
-  printf "   ${C}1${N}  2022-blake3-aes-128-gcm\n   ${C}2${N}  2022-blake3-aes-256-gcm\n"
-  printf "   ${C}3${N}  aes-256-gcm\n   ${C}4${N}  chacha20-ietf-poly1305\n"
+  printf "${C}1${N}  2022-blake3-aes-128-gcm\n   ${C}2${N}  2022-blake3-aes-256-gcm\n"
+  printf "${C}3${N}  aes-256-gcm\n   ${C}4${N}  chacha20-ietf-poly1305\n"
   ask "加密方式" "1"
   case $REPLY in
     2)
@@ -462,7 +462,7 @@ add_ss() {
 }
 
 pick_hy2_obfs() { # 设置 OBFS_T
-  printf "   ${C}0${N}  不启用\n   ${C}1${N}  salamander\n   ${C}2${N}  gecko  ${D}(需 sing-box>=1.14)${N}\n"
+  printf "${C}0${N}  不启用\n   ${C}1${N}  salamander\n   ${C}2${N}  gecko  ${D}(需 sing-box>=1.14)${N}\n"
   ask "QUIC 混淆" "0"
   OBFS_T=""
   case $REPLY in
@@ -555,11 +555,11 @@ menu_add() {
   local c
   while :; do
     title "添加节点"
-    printf "   ${C}1${N}  VLESS          ${C}2${N}  Hysteria2\n"
-    printf "   ${C}3${N}  AnyTLS         ${C}4${N}  Snell\n"
-    printf "   ${C}5${N}  Shadowsocks    ${C}6${N}  SOCKS\n"
-    printf "   ${C}0${N}  返回\n\n"
-    read -rp "  > " c || return
+    printf "${C}1${N}  VLESS          ${C}2${N}  Hysteria2\n"
+    printf "${C}3${N}  AnyTLS         ${C}4${N}  Snell\n"
+    printf "${C}5${N}  Shadowsocks    ${C}6${N}  SOCKS\n"
+    printf "${C}0${N}  返回\n"
+    read -rp "> " c || return
     [[ -z $c ]] && continue
     [[ $c == 0 ]] && return
     [[ $c =~ ^[1-6]$ ]] && break
@@ -634,23 +634,23 @@ show_link() {
   local name t host meta
   meta=$(jq -r --argjson i "$IDX" '(.[$i] // {}) | [(.tag // ""), (.type // ""), (.host // "")] | join("\u001f")' "$NODES")
   IFS=$'\x1f' read -r name t host <<<"$meta"
-  printf "  ${B}%s${N}" "$name"
+  printf "${B}%s${N}" "$name"
   [[ $t == snell ]] && printf "  ${D}(Surge)${N}"
   echo
   if [[ -n $host ]]; then
-    printf "  ${G}%s${N}\n\n" "$(build_link "$host")"
+    printf "${G}%s${N}\n" "$(build_link "$host")"
     return
   fi
   detect_ips
   if [[ -n $PUBIP4 && -n $PUBIP6 ]]; then
-    printf "  ${D}[IPv4]${N} ${G}%s${N}\n" "$(build_link "$PUBIP4")"
-    printf "  ${D}[IPv6]${N} ${G}%s${N}\n\n" "$(build_link "$PUBIP6")"
+    printf "${D}[IPv4]${N} ${G}%s${N}\n" "$(build_link "$PUBIP4")"
+    printf "${D}[IPv6]${N} ${G}%s${N}\n" "$(build_link "$PUBIP6")"
   elif [[ -n $PUBIP4 ]]; then
-    printf "  ${G}%s${N}\n\n" "$(build_link "$PUBIP4")"
+    printf "${G}%s${N}\n" "$(build_link "$PUBIP4")"
   elif [[ -n $PUBIP6 ]]; then
-    printf "  ${G}%s${N}\n\n" "$(build_link "$PUBIP6")"
+    printf "${G}%s${N}\n" "$(build_link "$PUBIP6")"
   else
-    printf "  ${G}%s${N}\n\n" "$(build_link "YOUR_IP")"
+    printf "${G}%s${N}\n" "$(build_link "YOUR_IP")"
   fi
 }
 
@@ -890,7 +890,6 @@ menu_edit() {
     sleep 1
     return
   }
-  echo
   choose_node || return
   local dirty=0 i f k v
   snapshot
@@ -904,12 +903,11 @@ menu_edit() {
         v=$(g "$k")
         [[ -z $v ]] && v="—"
       fi
-      printf "   ${C}%-2s${N} %-14s ${D}%s${N}\n" "$i" "${f#*:}" "$v"
+      printf "${C}%-2s${N} %-14s ${D}%s${N}\n" "$i" "${f#*:}" "$v"
       ((i++))
     done
-    printf "   ${C}0${N}  保存并返回\n"
-    echo
-    read -rp "  > " c || break
+    printf "${C}0${N}  保存并返回\n"
+    read -rp "> " c || break
     [[ -z $c ]] && continue
     [[ $c == 0 ]] && break
     if [[ $c =~ ^[0-9]{1,2}$ ]] && ((10#$c >= 1 && 10#$c <= ${#FIELDS[@]})); then
@@ -936,7 +934,6 @@ menu_del() {
     sleep 1
     return
   }
-  echo
   choose_node || return
   local port
   port=$(g port)
@@ -957,9 +954,8 @@ menu_service() {
     title "服务管理"
     auto="${D}[已关闭]${N}"
     svc_ctl is-enabled && auto="${G}[已开启]${N}"
-    printf "   ${C}1${N}  启动 / 重启\n   ${C}2${N}  停止服务\n   ${C}3${N}  开机自启  %s\n   ${C}0${N}  返回\n" "$auto"
-    echo
-    read -rp "  > " c || return
+    printf "${C}1${N}  启动 / 重启\n   ${C}2${N}  停止服务\n   ${C}3${N}  开机自启  %s\n   ${C}0${N}  返回\n" "$auto"
+    read -rp "> " c || return
     [[ -z $c ]] && continue
     [[ $c == 0 ]] && return
     case $c in
@@ -991,7 +987,7 @@ menu_service() {
 uninstall() {
   title "${R}彻底卸载${N}"
   warn "将删除内核、配置、节点、证书、日志及快捷命令，不可恢复"
-  read -rp "  输入 yes 确认卸载: " v
+  read -rp "输入 yes 确认卸载: " v
   [[ $v == yes ]] || return
   svc_ctl stop
   svc_ctl disable
@@ -1007,7 +1003,6 @@ uninstall() {
 # ───────── 主界面 ─────────
 header() {
   clear
-  echo
   if sb_installed; then
     local st n=0 v
     [[ -f $NODES ]] && n=$(jq length "$NODES" 2>/dev/null || echo 0)
@@ -1015,23 +1010,21 @@ header() {
       st="${G}● 运行中${N}"
     else st="${D}○ 已停止${N}"; fi
     v=$(sb_version)
-    printf "  ${B}sing-box${N}  %s  ${D}v%s · %s 节点${N}\n" "$st" "${v:-?}" "$n"
+    printf "${B}sing-box${N}  %s  ${D}v%s · %s 节点${N}\n" "$st" "${v:-?}" "$n"
   else
-    printf "  ${B}sing-box${N}\n"
+    printf "${B}sing-box${N}\n"
   fi
-  echo
 }
 
 main_menu() {
   while :; do
     header
-    printf "   ${C}1${N}  节点列表       ${C}6${N}  服务管理\n"
-    printf "   ${C}2${N}  添加节点       ${C}7${N}  运行日志\n"
-    printf "   ${C}3${N}  编辑节点       ${C}8${N}  更新内核\n"
-    printf "   ${C}4${N}  删除节点       ${C}9${N}  彻底卸载\n"
-    printf "   ${C}5${N}  分享链接       ${C}0${N}  退出\n"
-    echo
-    read -rp "  > " c || exit 0
+    printf "${C}1${N}  节点列表       ${C}6${N}  服务管理\n"
+    printf "${C}2${N}  添加节点       ${C}7${N}  运行日志\n"
+    printf "${C}3${N}  编辑节点       ${C}8${N}  更新内核\n"
+    printf "${C}4${N}  删除节点       ${C}9${N}  彻底卸载\n"
+    printf "${C}5${N}  分享链接       ${C}0${N}  退出\n"
+    read -rp "> " c || exit 0
     case $c in
       1)
         title "节点列表"

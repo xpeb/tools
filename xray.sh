@@ -28,11 +28,11 @@ fi
 
 # ───────── UI ─────────
 B=$'\e[1m' D=$'\e[2m' G=$'\e[32m' R=$'\e[31m' Y=$'\e[33m' C=$'\e[36m' N=$'\e[0m'
-info() { printf "  ${D}[信息]${N} %s\n" "$*"; }
-note() { printf "  ${C}[注意]${N} %s\n" "$*"; }
-warn() { printf "  ${Y}[警告]${N} %s\n" "$*"; }
-ok() { printf "  ${G}[正确]${N} %s\n" "$*"; }
-err() { printf "  ${R}[错误]${N} %s\n" "$*"; }
+info() { printf "${D}[信息]${N} %s\n" "$*"; }
+note() { printf "${C}[注意]${N} %s\n" "$*"; }
+warn() { printf "${Y}[警告]${N} %s\n" "$*"; }
+ok() { printf "${G}[正确]${N} %s\n" "$*"; }
+err() { printf "${R}[错误]${N} %s\n" "$*"; }
 pause() {
   echo
   read -rsp "  按回车返回…" _
@@ -40,7 +40,7 @@ pause() {
 }
 title() {
   header
-  printf "  ${C}▸${N} ${B}%s${N}\n\n" "$1"
+  printf "${C}▸${N} ${B}%s${N}\n" "$1"
 }
 
 ask() { # $1=提示 $2=默认 -> REPLY
@@ -145,7 +145,7 @@ svc_logs() {
     out=$(tail -n 40 "$XR_LOG" 2>/dev/null)
   fi
   if [[ -n $out ]]; then
-    printf '%s\n' "$out" | sed 's/^/  /'
+    printf '%s\n' "$out" | cat
   else
     info "暂无日志"
   fi
@@ -297,7 +297,7 @@ apply() {
   local out
   if ! out=$("$XR_BIN" run -test -c "$CONF_TMP" 2>&1); then
     err "配置校验失败"
-    echo "$out" | sed 's/^/    /'
+    echo "$out" | cat
     rm -f "$CONF_TMP"
     return 1
   fi
@@ -466,11 +466,11 @@ gen_reality() {
 gen_uuid() { "$XR_BIN" uuid 2>/dev/null || cat /proc/sys/kernel/random/uuid; }
 
 pick_ss_method() { # 设置 SS_M 和 SS_P
-  printf "   ${C}1${N}  2022-blake3-aes-128-gcm      ${D}(推荐)${N}\n"
-  printf "   ${C}2${N}  2022-blake3-aes-256-gcm\n"
-  printf "   ${C}3${N}  2022-blake3-chacha20-poly1305\n"
-  printf "   ${C}4${N}  aes-256-gcm\n"
-  printf "   ${C}5${N}  chacha20-ietf-poly1305\n"
+  printf "${C}1${N}  2022-blake3-aes-128-gcm      ${D}(推荐)${N}\n"
+  printf "${C}2${N}  2022-blake3-aes-256-gcm\n"
+  printf "${C}3${N}  2022-blake3-chacha20-poly1305\n"
+  printf "${C}4${N}  aes-256-gcm\n"
+  printf "${C}5${N}  chacha20-ietf-poly1305\n"
   ask "加密方式" "1"
   case $REPLY in
     2)
@@ -527,8 +527,8 @@ _add_tls_pw() { # $1=type $2=tag前缀
 add_vless() {
   ask_port
   local tr=raw sni path=""
-  printf "   ${C}1${N}  RAW + Reality (Vision)  ${D}(推荐)${N}\n"
-  printf "   ${C}2${N}  XHTTP + Reality\n"
+  printf "${C}1${N}  RAW + Reality (Vision)  ${D}(推荐)${N}\n"
+  printf "${C}2${N}  XHTTP + Reality\n"
   while :; do
     ask "传输方式" "1"
     case $REPLY in
@@ -566,11 +566,11 @@ menu_add() {
   local c
   while :; do
     title "添加节点"
-    printf "   ${C}1${N}  VLESS          ${C}2${N}  Hysteria2\n"
-    printf "   ${C}3${N}  Trojan         ${C}4${N}  VMess\n"
-    printf "   ${C}5${N}  Shadowsocks    ${C}6${N}  SOCKS\n"
-    printf "   ${C}0${N}  返回\n\n"
-    read -rp "  > " c || return
+    printf "${C}1${N}  VLESS          ${C}2${N}  Hysteria2\n"
+    printf "${C}3${N}  Trojan         ${C}4${N}  VMess\n"
+    printf "${C}5${N}  Shadowsocks    ${C}6${N}  SOCKS\n"
+    printf "${C}0${N}  返回\n"
+    read -rp "> " c || return
     [[ -z $c ]] && continue
     [[ $c == 0 ]] && return
     [[ $c =~ ^[1-6]$ ]] && break
@@ -666,19 +666,19 @@ show_link() {
   IFS=$'\x1f' read -r name host <<<"$meta"
   printf "  ${B}%s${N}\n" "$name"
   if [[ -n $host ]]; then
-    printf "  ${G}%s${N}\n\n" "$(build_link "$host")"
+    printf "${G}%s${N}\n" "$(build_link "$host")"
     return
   fi
   detect_ips
   if [[ -n $PUBIP4 && -n $PUBIP6 ]]; then
-    printf "  ${D}[IPv4]${N} ${G}%s${N}\n" "$(build_link "$PUBIP4")"
-    printf "  ${D}[IPv6]${N} ${G}%s${N}\n\n" "$(build_link "$PUBIP6")"
+    printf "${D}[IPv4]${N} ${G}%s${N}\n" "$(build_link "$PUBIP4")"
+    printf "${D}[IPv6]${N} ${G}%s${N}\n" "$(build_link "$PUBIP6")"
   elif [[ -n $PUBIP4 ]]; then
-    printf "  ${G}%s${N}\n\n" "$(build_link "$PUBIP4")"
+    printf "${G}%s${N}\n" "$(build_link "$PUBIP4")"
   elif [[ -n $PUBIP6 ]]; then
-    printf "  ${G}%s${N}\n\n" "$(build_link "$PUBIP6")"
+    printf "${G}%s${N}\n" "$(build_link "$PUBIP6")"
   else
-    printf "  ${G}%s${N}\n\n" "$(build_link "YOUR_IP")"
+    printf "${G}%s${N}\n" "$(build_link "YOUR_IP")"
   fi
 }
 
@@ -690,7 +690,6 @@ menu_links() {
   }
   local n i
   n=$(jq length "$NODES")
-  echo
   while :; do
     ask "编号（a=全部，0=返回）" "a"
     [[ $REPLY == 0 ]] && return
@@ -779,7 +778,7 @@ edit_field() {
       ;;
     transport)
       local nt
-      printf "   ${C}1${N}  RAW (Vision)\n   ${C}2${N}  XHTTP\n"
+      printf "${C}1${N}  RAW (Vision)\n   ${C}2${N}  XHTTP\n"
       while :; do
         ask "传输方式（0=取消）" "${cur:-raw}"
         [[ $REPLY == 0 ]] && return 1
@@ -851,7 +850,6 @@ menu_edit() {
     sleep 1
     return
   }
-  echo
   choose_node || return
   local dirty=0 i f k v
   snapshot
@@ -867,12 +865,11 @@ menu_edit() {
         v=$(g "$k")
         [[ -z $v ]] && v="—"
       fi
-      printf "   ${C}%-2s${N} %-14s ${D}%s${N}\n" "$i" "${f#*:}" "$v"
+      printf "${C}%-2s${N} %-14s ${D}%s${N}\n" "$i" "${f#*:}" "$v"
       ((i++))
     done
-    printf "   ${C}0${N}  保存并返回\n"
-    echo
-    read -rp "  > " c || break
+    printf "${C}0${N}  保存并返回\n"
+    read -rp "> " c || break
     [[ -z $c ]] && continue
     [[ $c == 0 ]] && break
     if [[ $c =~ ^[0-9]{1,2}$ ]] && ((10#$c >= 1 && 10#$c <= ${#FIELDS[@]})); then
@@ -899,7 +896,6 @@ menu_del() {
     sleep 1
     return
   }
-  echo
   choose_node || return
   local port
   port=$(g port)
@@ -920,9 +916,8 @@ menu_service() {
     title "服务管理"
     auto="${D}[已关闭]${N}"
     svc_ctl is-enabled && auto="${G}[已开启]${N}"
-    printf "   ${C}1${N}  启动 / 重启\n   ${C}2${N}  停止服务\n   ${C}3${N}  开机自启  %s\n   ${C}0${N}  返回\n" "$auto"
-    echo
-    read -rp "  > " c || return
+    printf "${C}1${N}  启动 / 重启\n   ${C}2${N}  停止服务\n   ${C}3${N}  开机自启  %s\n   ${C}0${N}  返回\n" "$auto"
+    read -rp "> " c || return
     [[ -z $c ]] && continue
     [[ $c == 0 ]] && return
     case $c in
@@ -954,7 +949,7 @@ menu_service() {
 uninstall() {
   title "${R}彻底卸载${N}"
   warn "将删除内核、配置、节点、证书、日志及快捷命令，不可恢复"
-  read -rp "  输入 yes 确认卸载: " v
+  read -rp "输入 yes 确认卸载: " v
   [[ $v == yes ]] || return
   svc_ctl stop
   svc_ctl disable
@@ -970,7 +965,6 @@ uninstall() {
 # ───────── 主界面 ─────────
 header() {
   clear
-  echo
   if xr_installed; then
     local st n=0 v
     [[ -f $NODES ]] && n=$(jq length "$NODES" 2>/dev/null || echo 0)
@@ -978,23 +972,21 @@ header() {
       st="${G}● 运行中${N}"
     else st="${D}○ 已停止${N}"; fi
     v=$(xr_version)
-    printf "  ${B}xray${N}  %s  ${D}v%s · %s 节点${N}\n" "$st" "${v:-?}" "$n"
+    printf "${B}xray${N}  %s  ${D}v%s · %s 节点${N}\n" "$st" "${v:-?}" "$n"
   else
-    printf "  ${B}xray${N}\n"
+    printf "${B}xray${N}\n"
   fi
-  echo
 }
 
 main_menu() {
   while :; do
     header
-    printf "   ${C}1${N}  节点列表       ${C}6${N}  服务管理\n"
-    printf "   ${C}2${N}  添加节点       ${C}7${N}  运行日志\n"
-    printf "   ${C}3${N}  编辑节点       ${C}8${N}  更新内核\n"
-    printf "   ${C}4${N}  删除节点       ${C}9${N}  彻底卸载\n"
-    printf "   ${C}5${N}  分享链接       ${C}0${N}  退出\n"
-    echo
-    read -rp "  > " c || exit 0
+    printf "${C}1${N}  节点列表       ${C}6${N}  服务管理\n"
+    printf "${C}2${N}  添加节点       ${C}7${N}  运行日志\n"
+    printf "${C}3${N}  编辑节点       ${C}8${N}  更新内核\n"
+    printf "${C}4${N}  删除节点       ${C}9${N}  彻底卸载\n"
+    printf "${C}5${N}  分享链接       ${C}0${N}  退出\n"
+    read -rp "> " c || exit 0
     case $c in
       1)
         title "节点列表"
