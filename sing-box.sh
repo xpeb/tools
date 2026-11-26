@@ -521,7 +521,7 @@ install_sb() {
 
 # ───────── 配置生成（严格遵循 sing-box 官方文档 1.14+ 标准）─────────
 _listen_mode() {
-  if [[ ! -s /proc/net/if_inet6 ]]; then
+  if ! grep -q . /proc/net/if_inet6 2>/dev/null; then
     echo v4
   elif [[ $(cat /proc/sys/net/ipv6/bindv6only 2>/dev/null) == 1 ]] && ip -4 route show default 2>/dev/null | grep -q .; then
     if ip -6 route show default 2>/dev/null | grep -q .; then

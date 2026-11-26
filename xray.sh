@@ -491,7 +491,7 @@ install_xray() {
 
 # ───────── 配置生成（路由仅依赖 CIDR 与域名，无需 geoip/geosite）─────────
 _listen_mode() {
-  if [[ ! -s /proc/net/if_inet6 ]]; then
+  if ! grep -q . /proc/net/if_inet6 2>/dev/null; then
     echo v4
   elif [[ $(cat /proc/sys/net/ipv6/bindv6only 2>/dev/null) == 1 ]] && ip -4 route show default 2>/dev/null | grep -q .; then
     if ip -6 route show default 2>/dev/null | grep -q .; then
@@ -609,7 +609,7 @@ gen_config() {
           ip: [
             "0.0.0.0/8", "127.0.0.0/8", "10.0.0.0/8", "100.64.0.0/10",
             "172.16.0.0/12", "192.168.0.0/16", "169.254.0.0/16",
-            "::/128", "::1/128", "::ffff:0:0/96", "fc00::/7", "fe80::/10"
+            "::/128", "::1/128", "fc00::/7", "fe80::/10"
           ],
           outboundTag: "block"
         }
@@ -903,8 +903,8 @@ choose_node() { # 交互选择节点并设置 IDX；取消返回 1
 gen_reality() {
   local out
   out=$("$XR_BIN" x25519 2>/dev/null) || { err "生成 Reality 密钥失败"; return 1; }
-  RPRIV=$(awk -F': *' '/^Private/{print $2; exit}' <<<"$out" | tr -d '[:space:]')
-  RPUB=$(awk -F': *' '/^(Public ?[Kk]ey|Password):/{print $2; exit}' <<<"$out" | tr -d '[:space:]')
+  RPRIV=$(awk -F': *' '/^Private([[:space:]]*[Kk]ey)?:[[:space:]]*/{print $2; exit}' <<<"$out" | tr -d '[:space:]')
+  RPUB=$(awk -F': *' '/^(Public ?[Kk]ey|Password([[:space:]]*\(PublicKey\))?):[[:space:]]*/{print $2; exit}' <<<"$out" | tr -d '[:space:]')
   [[ -n $RPRIV && -n $RPUB ]] || { err "解析 xray x25519 输出失败"; return 1; }
   RSID=$(openssl rand -hex 4)
 }
@@ -1605,8 +1605,13 @@ menu_service() {
       1)
         echo
         if apply; then
-          toast_fn=ok
-          toast_msg="服务已重新加载并运行正常"
+          if (($(node_count) == 0)); then
+            toast_fn=note
+            toast_msg="当前无可用节点，服务保持停止"
+          else
+            toast_fn=ok
+            toast_msg="服务已重新加载并运行正常"
+          fi
         else
           pause
         fi
