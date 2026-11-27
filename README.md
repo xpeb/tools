@@ -18,6 +18,12 @@ bash <(curl -fsSL https://raw.githubusercontent.com/xpeb/vps-tools/main/xray.sh)
 bash <(curl -fsSL https://raw.githubusercontent.com/xpeb/vps-tools/main/sing-box.sh)
 ```
 
+## nftables.sh
+
+```bash
+bash <(curl -fsSL https://raw.githubusercontent.com/xpeb/vps-tools/main/nftables.sh)
+```
+
 ## cliproxyapi.sh
 
 ```bash
